@@ -1,5 +1,5 @@
 import type { GraphAccess } from "./access.js";
-import { judgeWritten } from "./contradiction.js";
+import { judgedRivals, judgeWritten } from "./contradiction.js";
 import { ExtractionError, errorMessage, SelfGraphError, ValidationError } from "./errors.js";
 import { NERExtractor } from "./extraction/basic.js";
 import { LLMExtractor } from "./extraction/extractor.js";
@@ -243,7 +243,9 @@ export class Insert {
             ),
           )
         : activeResolver;
+    const deferred: string[] = [];
     const result = await this.graph.write(async (tx, ns) => {
+      deferred.length = 0;
       const canonical = await ops.validateFacts(tx, ns, facts, (o) => canonicalizeTypes(o, activeSchema));
       let resolution =
         writeResolver === null ? null : await planResolution(tx, ns, canonical, writeResolver, activeSchema, createdAt);
@@ -299,12 +301,17 @@ export class Insert {
       if (source.replace_source && source.source_id !== null && sourceVersion !== null) {
         const produced = new Set(relations.map((r) => r.id));
         const at = source.default_event_time ?? createdAt;
+        const stale = [...prior].filter((id) => !produced.has(id));
+        if (judged && llm !== null) {
+          const rivals = await judgedRivals(tx, ns, relations, caps, createdAt);
+          deferred.push(...stale.filter((id) => rivals.has(id)).sort(comparePy));
+        }
         const [retired, notes] = await ops.replaceSource(
           tx,
           ns,
           source.source_id,
           sourceVersion,
-          [...prior].filter((id) => !produced.has(id)),
+          stale.filter((id) => !deferred.includes(id)),
           at,
           createdAt,
         );
@@ -365,6 +372,16 @@ export class Insert {
     if (judged && llm !== null) {
       const notes = await judgeWritten(this.graph, llm, result.relations, caps, createdAt);
       warnSchema(notes.filter((w) => w.code === "contradiction_not_judged"));
+      const sourceId = source.source_id;
+      const version = result.source_version;
+      if (deferred.length && result.source_diff && sourceId !== null && version !== null) {
+        const at = source.default_event_time ?? createdAt;
+        const [retired, replaced] = await this.graph.write((tx, ns) =>
+          ops.replaceSource(tx, ns, sourceId, version, deferred, at, createdAt),
+        );
+        result.source_diff.retired = [...new Set([...result.source_diff.retired, ...retired])].sort(comparePy);
+        notes.push(...replaced);
+      }
       result.warnings.push(...notes.map((w) => ({ ...w, source_id: source.source_id })));
     }
     return result;

@@ -280,7 +280,11 @@ retirement is a second, short write. It reads each rival and the new relation
 again under their source entities' locks, and drops the verdict when either one
 changed or was deleted since the LLM was asked. A rival certified in the meantime stays current with a
 `certified_kept` warning. Until that write commits, a read can see the new
-relation and its rival both current.
+relation and its rival both current. With `replace_source`, a rival the judge
+is asked about is left to the judge: the source replacement retires it after
+the judge, only when the judge kept it, so the result matches judging before
+the replacement. If the judge fails, the write still stands and the result has
+a `contradiction_not_judged` warning.
 
 The LLM can decide differently on a rerun. Use `max_count` where the rule is
 known, and keep `llm` for what a schema cannot state.

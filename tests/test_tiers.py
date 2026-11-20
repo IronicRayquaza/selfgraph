@@ -619,6 +619,23 @@ def test_llm_judge_drops_a_verdict_when_the_new_relation_changed_while_it_answer
     assert run(g.relations.get(GLOBEX)).revision == 2
 
 
+@pytest.mark.parametrize("retire", [True, False])
+def test_llm_judge_sees_a_rival_the_replaced_source_would_retire(retire):
+    g = fresh_graph("tier", llm=Judge([1] if retire else []), extraction="regex", contradiction="llm")
+    old = run(g.insert.text("Ann works at Acme.", source_id="hr")).relations[0]
+    res = run(g.insert.text("Ann works at Globex.", source_id="hr", replace_source=True))
+    new = res.relations[0]
+    codes = [w.code for w in res.warnings if w.code != "basic_extraction"]
+    stored = [v for v in run(g.relations.versions(old.id)) if v.invalidated_at is not None][0]
+    if retire:
+        assert codes == ["relation_superseded"] and res.source_diff.retired == []
+        assert stored.invalidated_by == new.id
+    else:
+        assert codes == ["fact_retired_by_source"] and res.source_diff.retired == [old.id]
+        assert stored.invalidated_by == res.source_version
+    assert [r.id for r in run(g.relations.list()).items] == [new.id]
+
+
 class FailingJudge:
     async def generate(self, *, system, user, output):
         raise RuntimeError("provider down")

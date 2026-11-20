@@ -11,7 +11,7 @@ from ._serde import L_ENTITY, decode_entity
 from .models import InsertWarning, Relation
 from .protocols import LLMClient
 
-__all__ = ["ask_judge", "apply_verdicts"]
+__all__ = ["ask_judge", "apply_verdicts", "judged_rivals"]
 
 _MAX_RIVALS = 20
 _SYSTEM = (
@@ -37,6 +37,29 @@ def _line(edge_type: str, source: str, target: str, properties: Mapping[str, Any
     """
     props = " {" + ", ".join(f"{k}={v}" for k, v in properties.items()) + "}" if properties else ""
     return f"{source} -[{edge_type}]-> {target}{props}"
+
+
+async def judged_rivals(
+    runner: Any,
+    ns: str,
+    written: list[Relation],
+    caps: Mapping[str, _ops.RelationCap] | None,
+    written_at: datetime,
+) -> set[str]:
+    """Name the older relations ask_judge would show the LLM for some written relations, without asking it.
+
+    @param runner (Any): graph runner.
+    @param ns (str): namespace.
+    @param written (list[Relation]): the relations a write stored.
+    @param caps (Mapping[str, RelationCap] | None): the schema's max_count limits by relation type.
+    @param written_at (datetime): the write's timestamp; only relations it created or revised are judged.
+    @return (set[str]): the rival relation ids.
+    """
+    fresh = {r.id for r in written if r.created_at == written_at}
+    if not fresh:
+        return set()
+    rivals = await _ops.rival_relations(runner, ns, written, caps, _MAX_RIVALS)
+    return {e["props"]["id"] for rid, edges in rivals.items() if rid in fresh for e in edges}
 
 
 async def ask_judge(

@@ -35,6 +35,31 @@ function line(edgeType: string, source: string, target: string, properties: Json
 }
 
 /**
+ * Name the older relations askJudge would show the LLM for some written relations, without asking it.
+ *
+ * @param runner (GraphPrimitives): the graph runner.
+ * @param ns (string): the namespace.
+ * @param written (readonly Relation[]): the relations a write stored.
+ * @param caps (ReadonlyMap<string, ops.RelationCap> | null): the schema's max_count limits by relation type.
+ * @param writtenAt (Date): the write's timestamp; only relations it created or revised are judged.
+ * @return (Set<string>): the rival relation ids.
+ */
+export async function judgedRivals(
+  runner: GraphPrimitives,
+  ns: string,
+  written: readonly Relation[],
+  caps: ReadonlyMap<string, ops.RelationCap> | null,
+  writtenAt: Date,
+): Promise<Set<string>> {
+  const fresh = new Set(written.filter((r) => r.created_at.getTime() === writtenAt.getTime()).map((r) => r.id));
+  if (!fresh.size) return new Set();
+  const rivals = await ops.rivalRelations(runner, ns, written, caps, MAX_RIVALS);
+  return new Set(
+    [...rivals].filter(([rid]) => fresh.has(rid)).flatMap(([, edges]) => edges.map((e) => e.props.id as string)),
+  );
+}
+
+/**
  * Ask the LLM which older relations each written relation makes untrue, without writing anything.
  *
  * Only relations the cardinality rules left alone are judged: one call per written relation that has a rival (see

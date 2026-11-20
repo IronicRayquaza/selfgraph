@@ -574,6 +574,25 @@ function suite(spec: StoreSpec): void {
     expect((await g.relations.get(GLOBEX))!.revision).toBe(2);
   });
 
+  it.each([true, false])("lets the judge see a rival the replaced source would retire (retire=%s)", async (retire) => {
+    const g = open({ llm: new Judge(retire ? [1] : []), extraction: "regex", contradiction: "llm" });
+    const old = (await g.insert.text("Ann works at Acme.", { source_id: "hr" })).relations[0]!;
+    const res = await g.insert.text("Ann works at Globex.", { source_id: "hr", replace_source: true });
+    const fresh = res.relations[0]!;
+    const codes = res.warnings.map((w) => w.code).filter((code) => code !== "basic_extraction");
+    const stored = (await g.relations.versions(old.id)).find((v) => v.invalidated_at !== null)!;
+    if (retire) {
+      expect([codes, res.source_diff!.retired, stored.invalidated_by]).toEqual([["relation_superseded"], [], fresh.id]);
+    } else {
+      expect([codes, res.source_diff!.retired, stored.invalidated_by]).toEqual([
+        ["fact_retired_by_source"],
+        [old.id],
+        res.source_version,
+      ]);
+    }
+    expect((await g.relations.list()).items.map((r) => r.id)).toEqual([fresh.id]);
+  });
+
   it.each(["insert", "create"])("warns instead of failing a committed write when the judge fails (%s)", async (via) => {
     const failing: LLMClient = {
       generate: async () => {

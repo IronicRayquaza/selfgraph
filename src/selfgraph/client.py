@@ -13,7 +13,7 @@ from ._diff import graph_diff
 from ._export import obsidian_vault
 from ._maintenance import inspect, scan_entities, scan_relations
 from ._serde import L_TRACE, aware, now
-from .contradiction import apply_verdicts, ask_judge
+from .contradiction import apply_verdicts, ask_judge, judged_rivals
 from .errors import CLOSED_MESSAGE, StoreError, TransientError, ValidationError, needs_llm
 from .extraction.extractor import LLMExtractor
 from .extraction.prompts import check_prompts
@@ -654,7 +654,10 @@ class SelfGraph:
             ahead = await _ops.validate_facts(reader, ns, facts, rewrite=lambda o: canonicalize_types(o, active_schema))
             active_resolver = await active_resolver.ask_ahead(reader, ns, ahead, active_schema, created_at)
 
+        deferred: list[str] = []
+
         async def _apply(tx: Any) -> InsertResult:
+            deferred.clear()
             _ops._require_datetime("event_time", default_event_time)
             canonical = await _ops.validate_facts(tx, ns, facts, rewrite=lambda o: canonicalize_types(o, active_schema))
             resolution = None
@@ -722,8 +725,11 @@ class SelfGraph:
             if replace_source and source_id is not None and source_version is not None:
                 produced = {r.id for r in relations}
                 at = aware(default_event_time or created_at)
+                stale = prior - produced
+                if judged and self._llm is not None:
+                    deferred.extend(sorted(stale & await judged_rivals(tx, ns, relations, caps, created_at)))
                 retired, notes = await _ops.replace_source(
-                    tx, ns, source_id, source_version, prior - produced, at, created_at
+                    tx, ns, source_id, source_version, stale - set(deferred), at, created_at
                 )
                 found.extend(notes)
                 diff = SourceDiff(kept=sorted(produced & prior), added=sorted(produced - prior), retired=retired)
@@ -795,5 +801,12 @@ class SelfGraph:
         if judged and self._llm is not None:
             notes = await self._judge(result.relations, caps, created_at)
             log_schema_warnings([w for w in notes if w.code == "contradiction_not_judged"])
+            if deferred and result.source_diff is not None and result.source_version is not None:
+                version, at = result.source_version, aware(default_event_time or created_at)
+                retired, replaced = await self._in_tx(
+                    lambda tx: _ops.replace_source(tx, ns, source_id, version, deferred, at, created_at)
+                )
+                result.source_diff.retired = sorted({*result.source_diff.retired, *retired})
+                notes += replaced
             result.warnings += [w.model_copy(update={"source_id": source_id}) for w in notes]
         return result
