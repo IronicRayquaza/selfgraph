@@ -86,6 +86,23 @@ class WritingLLM implements LLMClient {
   }
 }
 
+class PausedJudge implements LLMClient {
+  release: () => void = () => {};
+  private readonly released = new Promise<void>((resolve) => {
+    this.release = resolve;
+  });
+  private markAsked: () => void = () => {};
+  readonly asked = new Promise<void>((resolve) => {
+    this.markAsked = resolve;
+  });
+
+  async generate<T>(args: { system: string; user: string; output: z.ZodType<T> }): Promise<T> {
+    this.markAsked();
+    await this.released;
+    return args.output.parse({ retired: [] });
+  }
+}
+
 class FakeEmbedder implements Embedder {
   readonly calls: string[][] = [];
 
@@ -623,6 +640,45 @@ function suite(spec: StoreSpec): void {
       new Date(initech!.created_at as string).getTime(),
     );
   });
+
+  it.each(["globex", "initech"])(
+    "follows a deferred source replacement past a version appended while both wait (%s first)",
+    async (first) => {
+      const g = open({ extraction: "regex" });
+      await g.insert.text("Ann works at Acme.", { source_id: "hr" });
+      const judges = { globex: new PausedJudge(), initech: new PausedJudge() };
+      const tasks: Record<string, Promise<InsertResult>> = {};
+      for (const company of ["globex", "initech"] as const) {
+        const graph = new SelfGraph(g.store, {
+          namespace: g.namespace,
+          extraction: "regex",
+          llm: judges[company],
+          contradiction: "llm",
+        });
+        const text = `Ann works at ${company[0]!.toUpperCase()}${company.slice(1)}.`;
+        tasks[company] = graph.insert.text(text, { source_id: "hr", replace_source: true });
+        await judges[company].asked;
+      }
+      await g.insert.text("Bob works at Paris.", { source_id: "hr" });
+      for (const company of first === "globex" ? (["globex", "initech"] as const) : (["initech", "globex"] as const)) {
+        judges[company].release();
+        await tasks[company];
+      }
+      const initech = await tasks.initech!;
+      expect((await g.relations.list()).items.map((r) => r.to_entity).sort()).toEqual(["thing:initech", "thing:paris"]);
+      const acme = (await g.relations.list({ include_invalidated: true })).items.find(
+        (r) => r.to_entity === "thing:acme",
+      );
+      expect(acme!.invalidated_by).toBe(initech.source_version);
+      const stored = (await g.store.matchNodes(g.namespace, "SourceVersion")).find(
+        (v) => v.id === initech.source_version,
+      );
+      expect(stored!.replaced_by ?? null).toBeNull();
+      expect(acme!.invalidated_known_at!.getTime()).toBeGreaterThanOrEqual(
+        new Date(stored!.created_at as string).getTime(),
+      );
+    },
+  );
 
   it.each(["insert", "create"])("warns instead of failing a committed write when the judge fails (%s)", async (via) => {
     const failing: LLMClient = {

@@ -669,6 +669,47 @@ def test_a_deferred_source_replacement_skips_a_version_a_newer_replacement_super
     assert acme.invalidated_known_at >= datetime.fromisoformat(initech["created_at"])
 
 
+class PausedJudge:
+    def __init__(self):
+        self.asked = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def generate(self, *, system, user, output):
+        self.asked.set()
+        await asyncio.wait_for(self.release.wait(), timeout=5)
+        return output(retired=[])
+
+
+@pytest.mark.parametrize("first", ["globex", "initech"])
+def test_a_deferred_source_replacement_follows_the_newer_one_past_a_version_appended_while_both_wait(first):
+    g = fresh_graph("tier", extraction="regex")
+    run(g.insert.text("Ann works at Acme.", source_id="hr"))
+    judges = {"globex": PausedJudge(), "initech": PausedJudge()}
+
+    async def scenario():
+        tasks = {}
+        for company in ("globex", "initech"):
+            llm = judges[company]
+            graph = SelfGraph(store=g.store, namespace=g.namespace, extraction="regex", llm=llm, contradiction="llm")
+            text = f"Ann works at {company.capitalize()}."
+            tasks[company] = asyncio.ensure_future(graph.insert.text(text, source_id="hr", replace_source=True))
+            await asyncio.wait_for(judges[company].asked.wait(), timeout=5)
+        await g.insert.text("Bob works at Paris.", source_id="hr")
+        for company in (first, ({"globex", "initech"} - {first}).pop()):
+            judges[company].release.set()
+            await tasks[company]
+        return await tasks["initech"]
+
+    initech = run(scenario())
+    current = {r.to_entity for r in run(g.relations.list()).items}
+    assert current == {"thing:initech", "thing:paris"}
+    [acme] = [r for r in run(g.relations.list(include_invalidated=True)).items if r.to_entity == "thing:acme"]
+    assert acme.invalidated_by == initech.source_version
+    stored = {v["id"]: v for v in run(g.store.match_nodes(g.namespace, "SourceVersion"))}
+    assert stored[initech.source_version].get("replaced_by") is None
+    assert acme.invalidated_known_at >= datetime.fromisoformat(stored[initech.source_version]["created_at"])
+
+
 class FailingJudge:
     async def generate(self, *, system, user, output):
         raise RuntimeError("provider down")

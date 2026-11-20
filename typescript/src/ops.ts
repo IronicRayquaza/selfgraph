@@ -3330,7 +3330,7 @@ export async function sourceTargets(runner: Runner, ns: string, sourceId: string
 /**
  * Retire relations an insert left out of its source replacement, under the source's current version.
  *
- * The source is locked first, so a newer replacement of the same source either committed before this read or waits for this write. When one committed, the insert's version is no longer current and is not made current again: the relations are retired under the version that replaced it, which never saw them, since they rest only on versions already replaced, and are known retired no earlier than that version was written.
+ * The source is locked first, so a newer replacement of the same source either committed before this read or waits for this write. When one committed, the insert's version is no longer current and is not made current again: the relations are retired under the version that replaced it, which never saw them, since they rest only on versions already replaced, and are known retired no earlier than that version was written. When that version was itself replaced, its replaced_by is followed to the version still current. Another version written meanwhile without replace_source does not block the retirement, though it is current too.
  *
  * @param runner (Runner): the graph runner.
  * @param ns (string): the namespace.
@@ -3356,10 +3356,17 @@ export async function replaceSourceLate(
   if (stored === null) return [[], []];
   if ((stored.replaced_by ?? null) !== null) {
     const rows = await runner.childNodes(ns, L_SOURCE, node, R_HAS_VERSION, L_SOURCE_VERSION);
-    const current = rows.filter((row) => (row.replaced_by ?? null) === null);
-    if (current.length !== 1) return [[], []];
-    version = current[0]!.id as string;
-    const written = fromIso(current[0]!.created_at as string)!;
+    const byId = new Map(rows.map((row) => [row.id as string, row]));
+    const chain = [version];
+    for (;;) {
+      const step = (byId.get(chain[chain.length - 1]!)?.replaced_by ?? null) as string | null;
+      if (step === null || chain.includes(step)) break;
+      chain.push(step);
+    }
+    const current = byId.get(chain[chain.length - 1]!);
+    if (current === undefined || (current.replaced_by ?? null) !== null) return [[], []];
+    version = current.id as string;
+    const written = fromIso(current.created_at as string)!;
     if (written.getTime() > known.getTime()) known = written;
   }
   return replaceSource(runner, ns, sourceId, version, stale, at, known);

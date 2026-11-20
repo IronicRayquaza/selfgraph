@@ -3237,7 +3237,9 @@ async def replace_source_late(
     The source is locked first, so a newer replacement of the same source either committed before this read or waits
     for this write. When one committed, the insert's version is no longer current and is not made current again: the
     relations are retired under the version that replaced it, which never saw them, since they rest only on versions
-    already replaced, and are known retired no earlier than that version was written.
+    already replaced, and are known retired no earlier than that version was written. When that version was itself
+    replaced, its replaced_by is followed to the version still current. Another version written meanwhile without
+    replace_source does not block the retirement, though it is current too.
 
     @param runner (Any): graph runner.
     @param ns (str): namespace.
@@ -3254,11 +3256,15 @@ async def replace_source_late(
         return [], []
     if stored.get("replaced_by") is not None:
         rows = await runner.child_nodes(ns, L_SOURCE, _ids.source_node_id(source_id), R_HAS_VERSION, L_SOURCE_VERSION)
-        current = [row for row in rows if row.get("replaced_by") is None]
-        if len(current) != 1:
+        by_id = {row["id"]: row for row in rows}
+        chain = [version]
+        while (step := by_id.get(chain[-1], {}).get("replaced_by")) is not None and step not in chain:
+            chain.append(step)
+        current = by_id.get(chain[-1])
+        if current is None or current.get("replaced_by") is not None:
             return [], []
-        version = current[0]["id"]
-        known = max(known, aware(from_iso(current[0]["created_at"])))
+        version = current["id"]
+        known = max(known, aware(from_iso(current["created_at"])))
     return await replace_source(runner, ns, source_id, version, stale, at, known)
 
 
