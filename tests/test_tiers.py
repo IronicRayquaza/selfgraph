@@ -1,5 +1,6 @@
 import asyncio
 import contextvars
+from datetime import datetime
 
 import pytest
 from helpers import ANN_ACME_GLOBEX, cli, fresh_graph, mcp_session, run, store_settings, utc, works_at
@@ -664,6 +665,8 @@ def test_a_deferred_source_replacement_skips_a_version_a_newer_replacement_super
     assert stored[res.source_version] == newer[0].source_version
     [acme] = [r for r in run(g.relations.list(include_invalidated=True)).items if r.to_entity == "thing:acme"]
     assert acme.invalidated_by == newer[0].source_version
+    [initech] = [v for v in run(g.store.match_nodes(g.namespace, "SourceVersion")) if v["id"] == acme.invalidated_by]
+    assert acme.invalidated_known_at >= datetime.fromisoformat(initech["created_at"])
 
 
 class FailingJudge:

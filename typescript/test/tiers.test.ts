@@ -618,6 +618,10 @@ function suite(spec: StoreSpec): void {
       (r) => r.to_entity === "thing:acme",
     );
     expect(acme!.invalidated_by).toBe(newer[0]!.source_version);
+    const initech = (await g.store.matchNodes(g.namespace, "SourceVersion")).find((v) => v.id === acme!.invalidated_by);
+    expect(acme!.invalidated_known_at!.getTime()).toBeGreaterThanOrEqual(
+      new Date(initech!.created_at as string).getTime(),
+    );
   });
 
   it.each(["insert", "create"])("warns instead of failing a committed write when the judge fails (%s)", async (via) => {
