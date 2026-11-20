@@ -231,7 +231,7 @@ export class Insert {
       resolution: resolverTier,
       contradiction: judged ? "llm" : conflicts,
     };
-    const writeResolver =
+    const replay =
       activeResolver instanceof LLMResolver
         ? await this.graph.read(async (store, ns) =>
             activeResolver.askAhead(
@@ -242,13 +242,17 @@ export class Insert {
               createdAt,
             ),
           )
-        : activeResolver;
+        : null;
     const deferred: string[] = [];
     const result = await this.graph.write(async (tx, ns) => {
       deferred.length = 0;
       const canonical = await ops.validateFacts(tx, ns, facts, (o) => canonicalizeTypes(o, activeSchema));
       let resolution =
-        writeResolver === null ? null : await planResolution(tx, ns, canonical, writeResolver, activeSchema, createdAt);
+        activeResolver === null
+          ? null
+          : await (replay ?? ((call) => call()))(() =>
+              planResolution(tx, ns, canonical, activeResolver, activeSchema, createdAt),
+            );
       let resolved = resolution?.facts ?? canonical;
       let dropped: InsertWarning[] = [];
       if (extracted && mode === "strict") {
@@ -377,7 +381,7 @@ export class Insert {
       if (deferred.length && result.source_diff && sourceId !== null && version !== null) {
         const at = source.default_event_time ?? createdAt;
         const [retired, replaced] = await this.graph.write((tx, ns) =>
-          ops.replaceSource(tx, ns, sourceId, version, deferred, at, createdAt),
+          ops.replaceSourceLate(tx, ns, sourceId, version, deferred, at, createdAt),
         );
         result.source_diff.retired = [...new Set([...result.source_diff.retired, ...retired])].sort(comparePy);
         notes.push(...replaced);

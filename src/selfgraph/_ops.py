@@ -3229,6 +3229,38 @@ async def replace_source(
     return retired, warnings
 
 
+async def replace_source_late(
+    runner: Any, ns: str, source_id: str, version: str, stale: Iterable[str], at: datetime, known: datetime
+) -> tuple[list[str], list[InsertWarning]]:
+    """Retire relations an insert left out of its source replacement, under the source's current version.
+
+    The source is locked first, so a newer replacement of the same source either committed before this read or waits
+    for this write. When one committed, the insert's version is no longer current and is not made current again: the
+    relations are retired under the version that replaced it, which never saw them, since they rest only on versions
+    already replaced.
+
+    @param runner (Any): graph runner.
+    @param ns (str): namespace.
+    @param source_id (str): the source id.
+    @param version (str): the source version the insert recorded.
+    @param stale (Iterable[str]): the relation ids to retire, as replace_source takes them.
+    @param at (datetime): the insert's effective time.
+    @param known (datetime): the timestamp of the insert that recorded the version.
+    @return (tuple[list[str], list[InsertWarning]]): the retired relation ids and warnings, as replace_source returns.
+    """
+    await runner.lock_node(ns, L_SOURCE, _ids.source_node_id(source_id))
+    stored = await runner.get_node(ns, L_SOURCE_VERSION, version)
+    if stored is None:
+        return [], []
+    if stored.get("replaced_by") is not None:
+        rows = await runner.child_nodes(ns, L_SOURCE, _ids.source_node_id(source_id), R_HAS_VERSION, L_SOURCE_VERSION)
+        current = [row["id"] for row in rows if row.get("replaced_by") is None]
+        if len(current) != 1:
+            return [], []
+        version = current[0]
+    return await replace_source(runner, ns, source_id, version, stale, at, known)
+
+
 async def _ensure_profile(runner: Any, ns: str, subject_id: str, created_at: datetime) -> str:
     pid = _ids.profile_id(subject_id)
     if await runner.node_exists(ns, L_PROFILE, pid):

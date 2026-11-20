@@ -4,7 +4,16 @@ import contextvars
 import pytest
 from helpers import ANN_ACME_GLOBEX, cli, fresh_graph, mcp_session, run, store_settings, utc, works_at
 
-from selfgraph import LLMResolver, ResolutionDecision, Schema, TransientError, ValidationError, _ops, ids
+from selfgraph import (
+    LLMResolver,
+    ResolutionDecision,
+    Schema,
+    SelfGraph,
+    TransientError,
+    ValidationError,
+    _ops,
+    ids,
+)
 from selfgraph.runtime import build_graph
 from selfgraph.terms import schema_forms, stem
 
@@ -636,6 +645,27 @@ def test_llm_judge_sees_a_rival_the_replaced_source_would_retire(retire):
     assert [r.id for r in run(g.relations.list()).items] == [new.id]
 
 
+def test_a_deferred_source_replacement_skips_a_version_a_newer_replacement_superseded():
+    judge = WritingLLM({"retired": []})
+    g = fresh_graph("tier", llm=judge, extraction="regex", contradiction="llm")
+    run(g.insert.text("Ann works at Acme.", source_id="hr"))
+    other = SelfGraph(store=g.store, namespace=g.namespace, extraction="regex")
+    newer = []
+
+    async def initech():
+        newer.append(await other.insert.text("Ann works at Initech.", source_id="hr", replace_source=True))
+
+    judge.write = initech
+    res = run(g.insert.text("Ann works at Globex.", source_id="hr", replace_source=True))
+    assert len(judge.prompts) == 1 and len(newer) == 1
+    assert {r.to_entity for r in run(g.relations.list()).items} == {"thing:initech"}
+    stored = {v["id"]: v.get("replaced_by") for v in run(g.store.match_nodes(g.namespace, "SourceVersion"))}
+    assert stored[newer[0].source_version] is None
+    assert stored[res.source_version] == newer[0].source_version
+    [acme] = [r for r in run(g.relations.list(include_invalidated=True)).items if r.to_entity == "thing:acme"]
+    assert acme.invalidated_by == newer[0].source_version
+
+
 class FailingJudge:
     async def generate(self, *, system, user, output):
         raise RuntimeError("provider down")
@@ -686,6 +716,23 @@ def test_llm_resolver_answers_before_the_write_and_never_asks_inside_it():
     res = run(g.insert.facts({"entities": [{"type": "Person", "name": "Kathy Jones"}]}))
     assert [(m.absorbed_id, m.survivor_id) for m in res.merges] == [("person:kathy-jones", "person:katherine-jones")]
     assert len(llm.prompts) == 1 and run(g.entities.get("thing:unrelated")) is not None
+
+
+def test_an_llm_resolver_subclass_runs_as_given_and_asks_the_llm_once():
+    class Counting(LLMResolver):
+        calls = 0
+
+        async def resolve(self, candidate, existing):
+            self.calls += 1
+            return await super().resolve(candidate, existing)
+
+    llm = WritingLLM({"same": True})
+    g = fresh_graph("tier", llm=llm)
+    run(g.entities.create("Katherine Jones", "Person"))
+    resolver = Counting(llm)
+    res = run(g.insert.facts({"entities": [{"type": "Person", "name": "Kathy Jones"}]}, resolver=resolver))
+    assert [(m.absorbed_id, m.survivor_id) for m in res.merges] == [("person:kathy-jones", "person:katherine-jones")]
+    assert (len(llm.prompts), resolver.calls) == (1, 2)
 
 
 def test_an_llm_resolver_subclass_keeps_its_own_resolve():

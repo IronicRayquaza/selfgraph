@@ -648,11 +648,12 @@ class SelfGraph:
         if extraction is not None:
             used = {"extraction": extraction, **used}
 
+        replay = None
         if isinstance(active_resolver, LLMResolver):
             _ops._require_datetime("event_time", default_event_time)
             reader = await self._reader()
             ahead = await _ops.validate_facts(reader, ns, facts, rewrite=lambda o: canonicalize_types(o, active_schema))
-            active_resolver = await active_resolver.ask_ahead(reader, ns, ahead, active_schema, created_at)
+            replay = await active_resolver.ask_ahead(reader, ns, ahead, active_schema, created_at)
 
         deferred: list[str] = []
 
@@ -662,7 +663,8 @@ class SelfGraph:
             canonical = await _ops.validate_facts(tx, ns, facts, rewrite=lambda o: canonicalize_types(o, active_schema))
             resolution = None
             if active_resolver is not None:
-                resolution = await plan_resolution(tx, ns, canonical, active_resolver, active_schema, created_at)
+                plan = partial(plan_resolution, tx, ns, canonical, active_resolver, active_schema, created_at)
+                resolution = await (plan() if replay is None else replay(plan))
             resolved = resolution.facts if resolution is not None else canonical
             dropped: list[InsertWarning] = []
             if extracted and mode == "strict":
@@ -804,7 +806,7 @@ class SelfGraph:
             if deferred and result.source_diff is not None and result.source_version is not None:
                 version, at = result.source_version, aware(default_event_time or created_at)
                 retired, replaced = await self._in_tx(
-                    lambda tx: _ops.replace_source(tx, ns, source_id, version, deferred, at, created_at)
+                    lambda tx: _ops.replace_source_late(tx, ns, source_id, version, deferred, at, created_at)
                 )
                 result.source_diff.retired = sorted({*result.source_diff.retired, *retired})
                 notes += replaced

@@ -3328,6 +3328,42 @@ export async function sourceTargets(runner: Runner, ns: string, sourceId: string
 }
 
 /**
+ * Retire relations an insert left out of its source replacement, under the source's current version.
+ *
+ * The source is locked first, so a newer replacement of the same source either committed before this read or waits for this write. When one committed, the insert's version is no longer current and is not made current again: the relations are retired under the version that replaced it, which never saw them, since they rest only on versions already replaced.
+ *
+ * @param runner (Runner): the graph runner.
+ * @param ns (string): the namespace.
+ * @param sourceId (string): the source id.
+ * @param version (string): the source version the insert recorded.
+ * @param stale (Iterable<string>): the relation ids to retire, as replaceSource takes them.
+ * @param at (Date): the insert's effective time.
+ * @param known (Date): the timestamp of the insert that recorded the version.
+ * @return ([string[], InsertWarning[]]): the retired relation ids and warnings, as replaceSource returns.
+ */
+export async function replaceSourceLate(
+  runner: Runner,
+  ns: string,
+  sourceId: string,
+  version: string,
+  stale: Iterable<string>,
+  at: Date,
+  known: Date,
+): Promise<[string[], InsertWarning[]]> {
+  const node = ids.sourceNodeId(sourceId);
+  await runner.lockNode(ns, L_SOURCE, node);
+  const stored = await runner.getNode(ns, L_SOURCE_VERSION, version);
+  if (stored === null) return [[], []];
+  if ((stored.replaced_by ?? null) !== null) {
+    const rows = await runner.childNodes(ns, L_SOURCE, node, R_HAS_VERSION, L_SOURCE_VERSION);
+    const current = rows.filter((row) => (row.replaced_by ?? null) === null).map((row) => row.id as string);
+    if (current.length !== 1) return [[], []];
+    version = current[0]!;
+  }
+  return replaceSource(runner, ns, sourceId, version, stale, at, known);
+}
+
+/**
  * Make one version of a source replace its others: mark them replaced_at and replaced_by, so retrieval stops quoting
  * them, and retire the current relations among some candidates whose every evidence record is from one of them, as a
  * newer fact retires one: invalidated_at is set and nothing is deleted. Each version keeps its replacements, with when
