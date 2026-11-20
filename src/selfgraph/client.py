@@ -19,7 +19,7 @@ from .extraction.extractor import LLMExtractor
 from .extraction.prompts import check_prompts
 from .ids import _require_namespace, decision_id, type_name
 from .insert import Insert
-from .llm.base import resolve_llm
+from .llm.base import resolve_llm, summarize_error
 from .models import (
     AnswerabilityReport,
     CypherResult,
@@ -569,14 +569,22 @@ class SelfGraph:
 
         The LLM is asked outside any transaction, so no lock is held while it answers and a retried write never asks
         again; the write that retires reads each verdict's relations again under their locks (see apply_verdicts).
+        The write has already committed, so a failed judge does not fail it: it is reported as a
+        contradiction_not_judged warning naming the relations it did not judge.
 
         @param written (list[Relation]): the relations the write stored.
         @param caps (dict[str, Any]): the schema's max_count limits by relation type.
         @param written_at (datetime): the write's timestamp; only relations it created or revised are judged.
-        @return (list[InsertWarning]): the judge's relation_superseded and certified_kept warnings.
+        @return (list[InsertWarning]): the judge's relation_superseded and certified_kept warnings, or one
+            contradiction_not_judged warning when the judge failed.
         """
         reader = await self._reader()
-        chosen = await ask_judge(reader, self.namespace, self._llm, written, caps, written_at)  # type: ignore[arg-type]
+        try:
+            chosen = await ask_judge(reader, self.namespace, self._llm, written, caps, written_at)  # type: ignore[arg-type]
+        except Exception as exc:  # noqa: BLE001
+            unjudged = ", ".join(sorted({r.id for r in written if r.created_at == written_at}))
+            message = f"the LLM contradiction judge failed, so {unjudged} were not judged: {summarize_error(exc)}"
+            return [InsertWarning(code="contradiction_not_judged", message=message)]
         if not chosen:
             return []
         return await self._in_tx(lambda tx: apply_verdicts(tx, self.namespace, chosen, now()))
@@ -786,5 +794,6 @@ class SelfGraph:
         result = await self._in_tx(_apply)
         if judged and self._llm is not None:
             notes = await self._judge(result.relations, caps, created_at)
+            log_schema_warnings([w for w in notes if w.code == "contradiction_not_judged"])
             result.warnings += [w.model_copy(update={"source_id": source_id}) for w in notes]
         return result

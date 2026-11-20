@@ -4,7 +4,7 @@ import contextvars
 import pytest
 from helpers import ANN_ACME_GLOBEX, cli, fresh_graph, mcp_session, run, store_settings, utc, works_at
 
-from selfgraph import Schema, TransientError, ValidationError, _ops, ids
+from selfgraph import LLMResolver, ResolutionDecision, Schema, TransientError, ValidationError, _ops, ids
 from selfgraph.runtime import build_graph
 from selfgraph.terms import schema_forms, stem
 
@@ -619,6 +619,48 @@ def test_llm_judge_drops_a_verdict_when_the_new_relation_changed_while_it_answer
     assert run(g.relations.get(GLOBEX)).revision == 2
 
 
+class FailingJudge:
+    async def generate(self, *, system, user, output):
+        raise RuntimeError("provider down")
+
+
+@pytest.mark.parametrize("via", ["insert", "create"])
+def test_a_failed_llm_judge_warns_instead_of_failing_the_committed_write(via, caplog):
+    g = fresh_graph("tier", llm=FailingJudge(), extraction="regex", contradiction="llm")
+    run(g.insert.facts({"entities": ANN_ACME_GLOBEX, "relations": [works_at("acme", 2020)]}))
+    with caplog.at_level("WARNING", logger="selfgraph"):
+        if via == "insert":
+            warnings = run(g.insert.facts({"relations": [works_at("globex", 2022)]})).warnings
+        else:
+            run(g.relations.create("person:ann", "WORKS_AT", "company:globex", event_time="2022-01-01"))
+    message = f"the LLM contradiction judge failed, so {GLOBEX} were not judged: RuntimeError: provider down"
+    if via == "insert":
+        assert [(w.code, w.message) for w in warnings] == [("contradiction_not_judged", message)]
+    logged = [r.getMessage() for r in caplog.records if "contradiction_not_judged" in r.getMessage()]
+    assert logged == [f"schema warning [contradiction_not_judged]: {message}"]
+    assert {r.id for r in run(g.relations.list(from_entity="person:ann")).items} == {ACME, GLOBEX}
+
+
+@pytest.mark.parametrize("recreated", ["rival", "new"])
+def test_llm_judge_drops_a_verdict_when_a_relation_is_created_again_while_it_answered(recreated):
+    judge = WritingLLM({"retired": [1]})
+    g = fresh_graph("tier", llm=judge, extraction="regex", contradiction="llm")
+    run(g.insert.facts({"entities": ANN_ACME_GLOBEX, "relations": [works_at("acme", 2020)]}))
+    company, rid = ("acme", ACME) if recreated == "rival" else ("globex", GLOBEX)
+
+    async def recreate():
+        await g.relations.delete(rid)
+        await g.relations.create(
+            "person:ann", "WORKS_AT", f"company:{company}", properties={"role": "temp"}, contradiction="warn"
+        )
+
+    judge.write = recreate
+    res = run(g.insert.facts({"relations": [works_at("globex", 2022)]}))
+    assert len(judge.prompts) == 1 and res.warnings == []
+    current = {r.id: r for r in run(g.relations.list(from_entity="person:ann")).items}
+    assert set(current) == {ACME, GLOBEX} and (current[rid].revision, current[rid].properties) == (1, {"role": "temp"})
+
+
 def test_llm_resolver_answers_before_the_write_and_never_asks_inside_it():
     llm = WritingLLM({"same": True})
     g = fresh_graph("tier", llm=llm, resolver="llm")
@@ -627,6 +669,18 @@ def test_llm_resolver_answers_before_the_write_and_never_asks_inside_it():
     res = run(g.insert.facts({"entities": [{"type": "Person", "name": "Kathy Jones"}]}))
     assert [(m.absorbed_id, m.survivor_id) for m in res.merges] == [("person:kathy-jones", "person:katherine-jones")]
     assert len(llm.prompts) == 1 and run(g.entities.get("thing:unrelated")) is not None
+
+
+def test_an_llm_resolver_subclass_keeps_its_own_resolve():
+    class NeverMerge(LLMResolver):
+        async def resolve(self, candidate, existing):
+            return ResolutionDecision()
+
+    llm = WritingLLM({"same": True})
+    g = fresh_graph("tier", llm=llm)
+    run(g.entities.create("Katherine Jones", "Person"))
+    res = run(g.insert.facts({"entities": [{"type": "Person", "name": "Kathy Jones"}]}, resolver=NeverMerge(llm)))
+    assert res.merges == [] and run(g.entities.get("person:kathy-jones")) is not None
 
 
 def test_a_retried_write_does_not_ask_the_llm_resolver_again(monkeypatch):

@@ -16,8 +16,19 @@ import {
   ValidationError,
 } from "../src/index.js";
 import { callTool, close as closeMcp, configure as configureMcp } from "../src/mcp.js";
+import { LLMResolver, type ResolutionDecision } from "../src/resolution.js";
 import { stem } from "../src/terms.js";
-import { buildCli, forEachStore, freshGraphs, runCli, type StoreSpec, tempKuzu, uniqueNs, worksAt } from "./helpers.js";
+import {
+  buildCli,
+  captureLog,
+  forEachStore,
+  freshGraphs,
+  runCli,
+  type StoreSpec,
+  tempKuzu,
+  uniqueNs,
+  worksAt,
+} from "./helpers.js";
 
 const ACME = ids.relationId("person:ann", "WORKS_AT", "company:acme");
 const GLOBEX = ids.relationId("person:ann", "WORKS_AT", "company:globex");
@@ -563,6 +574,52 @@ function suite(spec: StoreSpec): void {
     expect((await g.relations.get(GLOBEX))!.revision).toBe(2);
   });
 
+  it.each(["insert", "create"])("warns instead of failing a committed write when the judge fails (%s)", async (via) => {
+    const failing: LLMClient = {
+      generate: async () => {
+        throw new Error("provider down");
+      },
+    };
+    const g = open({ llm: failing, extraction: "regex", contradiction: "llm" });
+    await g.insert.facts({ entities: ANN_ACME_GLOBEX, relations: [annAt("acme", 2020)] });
+    const { result: warnings, logged } = await captureLog(async () => {
+      if (via === "insert") return (await g.insert.facts({ relations: [annAt("globex", 2022)] })).warnings;
+      await g.relations.create("person:ann", "WORKS_AT", "company:globex", { event_time: "2022-01-01" });
+      return [];
+    });
+    const message = `the LLM contradiction judge failed, so ${GLOBEX} were not judged: Error: provider down`;
+    if (via === "insert")
+      expect(warnings.map((w) => [w.code, w.message])).toEqual([["contradiction_not_judged", message]]);
+    expect(logged.filter((line) => line.includes("contradiction_not_judged"))).toEqual([
+      `warning: schema warning [contradiction_not_judged]: ${message}`,
+    ]);
+    expect((await g.relations.list({ from_entity: "person:ann" })).items.map((r) => r.id).sort()).toEqual(
+      [ACME, GLOBEX].sort(),
+    );
+  });
+
+  it.each(["rival", "new"])(
+    "drops a judge verdict when the %s relation is created again while the LLM answered",
+    async (recreated) => {
+      const judge = new WritingLLM({ retired: [1] });
+      const g = open({ llm: judge, extraction: "regex", contradiction: "llm" });
+      await g.insert.facts({ entities: ANN_ACME_GLOBEX, relations: [annAt("acme", 2020)] });
+      const [company, rid] = recreated === "rival" ? ["acme", ACME] : ["globex", GLOBEX];
+      judge.write = async () => {
+        await g.relations.delete(rid);
+        await g.relations.create("person:ann", "WORKS_AT", `company:${company}`, {
+          properties: { role: "temp" },
+          contradiction: "warn",
+        });
+      };
+      const res = await g.insert.facts({ relations: [annAt("globex", 2022)] });
+      expect([judge.prompts.length, res.warnings]).toEqual([1, []]);
+      const current = new Map((await g.relations.list({ from_entity: "person:ann" })).items.map((r) => [r.id, r]));
+      expect([...current.keys()].sort()).toEqual([ACME, GLOBEX].sort());
+      expect([current.get(rid)!.revision, current.get(rid)!.properties]).toEqual([1, { role: "temp" }]);
+    },
+  );
+
   it("asks the LLM resolver before the write and never inside it", async () => {
     const llm = new WritingLLM({ same: true });
     const g = open({ llm, resolver: "llm" });
@@ -574,6 +631,23 @@ function suite(spec: StoreSpec): void {
     ]);
     expect(llm.prompts).toHaveLength(1);
     expect(await g.entities.get("thing:unrelated")).not.toBeNull();
+  });
+
+  it("keeps an LLMResolver subclass's own resolve", async () => {
+    class NeverMerge extends LLMResolver {
+      override async resolve(): Promise<ResolutionDecision> {
+        return {};
+      }
+    }
+    const llm = new WritingLLM({ same: true });
+    const g = open({ llm });
+    await g.entities.create("Katherine Jones", "Person");
+    const res = await g.insert.facts(
+      { entities: [{ type: "Person", name: "Kathy Jones" }] },
+      { resolver: new NeverMerge(llm) },
+    );
+    expect(res.merges).toEqual([]);
+    expect(await g.entities.get("person:kathy-jones")).not.toBeNull();
   });
 
   it("does not ask the LLM resolver again when the write is retried", async () => {

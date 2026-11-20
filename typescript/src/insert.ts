@@ -52,6 +52,7 @@ import {
   requireSchemaMode,
   type Schema,
   type SchemaMode,
+  warnSchema,
 } from "./schema.js";
 import {
   checkOptions,
@@ -363,6 +364,7 @@ export class Insert {
     });
     if (judged && llm !== null) {
       const notes = await judgeWritten(this.graph, llm, result.relations, caps, createdAt);
+      warnSchema(notes.filter((w) => w.code === "contradiction_not_judged"));
       result.warnings.push(...notes.map((w) => ({ ...w, source_id: source.source_id })));
     }
     return result;

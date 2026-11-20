@@ -103,14 +103,24 @@ async def ask_judge(
     return chosen
 
 
+def _version(edge: dict) -> tuple[int, str | None]:
+    """Identify the stored version of an edge row, so a relation deleted and created again does not match it.
+
+    @param edge (dict): the edge row.
+    @return (tuple[int, str | None]): its revision and creation time.
+    """
+    return _ops._revision(edge), edge["props"].get("created_at")
+
+
 async def apply_verdicts(
     runner: Any, ns: str, chosen: list[tuple[Relation, dict]], known: datetime
 ) -> list[InsertWarning]:
     """Retire the older relations the judge chose, each read again with its written relation under their source locks.
 
-    A verdict is stale, and left alone, when the rival or the written relation is gone, no longer current, or has
-    another revision than the one judged. A retired relation is invalidated by the written relation at its effective
-    time. A certified relation is never retired, as with the cardinality rules.
+    A verdict is stale, and left alone, when the rival or the written relation is gone, no longer current, or is
+    another version than the one judged: another revision, or the same revision created again after a delete. A
+    retired relation is invalidated by the written relation at its effective time. A certified relation is never
+    retired, as with the cardinality rules.
 
     @param runner (Any): graph runner.
     @param ns (str): namespace.
@@ -128,9 +138,9 @@ async def apply_verdicts(
         rid = asked.id
         new = await _ops.get_relation_current(runner, ns, rid)
         edge = await runner.get_current_edge(ns, judged["props"]["id"])
-        if new is None or new.revision != asked.revision:
+        if new is None or (new.revision, new.created_at) != (asked.revision, asked.created_at):
             continue
-        if edge is None or _ops._revision(edge) != _ops._revision(judged):
+        if edge is None or _version(edge) != _version(judged):
             continue
         if edge["props"].get("certified_at") is None:
             retirements.append((edge, rid, _ops.effective_time(new)))

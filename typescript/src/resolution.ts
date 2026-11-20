@@ -486,7 +486,7 @@ export class LLMResolver implements EntityResolver {
   }
 
   private withClient(client: LLMClient): LLMResolver {
-    return Object.assign(Object.create(LLMResolver.prototype) as LLMResolver, this, { llm: client });
+    return Object.assign(Object.create(Object.getPrototypeOf(this)) as LLMResolver, this, { llm: client });
   }
 }
 

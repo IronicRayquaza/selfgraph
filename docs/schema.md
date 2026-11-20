@@ -181,6 +181,7 @@ result full of `dropped_off_schema` warnings.
 | `certified_kept` | A [certified](trust.md#certification) relation stayed current where a contradiction or a replaced source would have retired it. |
 | `certified_dropped` | A write changed a certified relation, so its new revision is not certified. |
 | `fact_retired_by_source` | A [replaced source](inserting.md#replacing-a-source) no longer states a relation, so it was retired. |
+| `contradiction_not_judged` | With `contradiction="llm"`, the judge failed after the write committed, so the relations it names were stored without being judged. Also logged on the `selfgraph` logger. |
 
 Cardinality is counted per insert call, over that batch's relations only. So:
 

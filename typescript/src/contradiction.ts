@@ -2,7 +2,9 @@ import { z } from "zod";
 
 import type { GraphAccess } from "./access.js";
 import { comparePy, pyStr } from "./internal/py.js";
+import { epochMicros } from "./internal/time.js";
 import { L_ENTITY } from "./labels.js";
+import { summarizeError } from "./llm/index.js";
 import { type InsertWarning, insertWarning, type JsonObject, parseOrThrow, type Relation } from "./models.js";
 import * as ops from "./ops.js";
 import type { EdgeRow, GraphPrimitives, LLMClient } from "./protocols.js";
@@ -98,9 +100,20 @@ export async function askJudge(
 }
 
 /**
+ * Tell whether two edge rows are the same stored version, so a relation deleted and created again does not match.
+ *
+ * @param a (EdgeRow): one edge row.
+ * @param b (EdgeRow): the other edge row.
+ * @return (boolean): true when their revision and creation time agree.
+ */
+function sameVersion(a: EdgeRow, b: EdgeRow): boolean {
+  return ops.revisionOf(a) === ops.revisionOf(b) && a.props.created_at === b.props.created_at;
+}
+
+/**
  * Retire the older relations the judge chose, each read again with its written relation under their source locks.
  *
- * A verdict is stale, and left alone, when the rival or the written relation is gone, no longer current, or has another revision than the one judged. A retired relation is invalidated by the written relation at its effective time. A certified relation is never retired, as with the cardinality rules.
+ * A verdict is stale, and left alone, when the rival or the written relation is gone, no longer current, or is another version than the one judged: another revision, or the same revision created again after a delete. A retired relation is invalidated by the written relation at its effective time. A certified relation is never retired, as with the cardinality rules.
  *
  * @param runner (GraphPrimitives): the graph runner.
  * @param ns (string): the namespace.
@@ -121,9 +134,15 @@ export async function applyVerdicts(
   for (const [asked, judged] of chosen) {
     const rid = asked.id;
     const fresh = await ops.getRelationCurrent(runner, ns, rid);
-    if (fresh === null || fresh.revision !== asked.revision) continue;
+    if (
+      fresh === null ||
+      fresh.revision !== asked.revision ||
+      epochMicros(fresh.created_at) !== epochMicros(asked.created_at)
+    ) {
+      continue;
+    }
     const edge = await runner.getCurrentEdge(ns, judged.props.id as string);
-    if (edge === null || ops.revisionOf(edge) !== ops.revisionOf(judged)) continue;
+    if (edge === null || !sameVersion(edge, judged)) continue;
     if (edge.props.certified_at === null || edge.props.certified_at === undefined) {
       retirements.push([edge, rid, ops.effectiveTime(fresh)]);
       continue;
@@ -146,12 +165,14 @@ export async function applyVerdicts(
 /**
  * Ask the LLM judge about relations a committed write stored, then retire what it chose in a short write.
  *
+ * The write has already committed, so a failed judge does not fail it: it is reported as a contradiction_not_judged warning naming the relations it did not judge.
+ *
  * @param graph (GraphAccess): the graph, to read outside any transaction and then write.
  * @param llm (LLMClient): the LLM to ask.
  * @param written (readonly Relation[]): the relations the write stored.
  * @param caps (ReadonlyMap<string, ops.RelationCap> | null): the schema's max_count limits by relation type.
  * @param writtenAt (Date): the write's timestamp; only relations it created or revised are judged.
- * @return (InsertWarning[]): the judge's relation_superseded and certified_kept warnings.
+ * @return (InsertWarning[]): the judge's relation_superseded and certified_kept warnings, or one contradiction_not_judged warning when the judge failed.
  */
 export async function judgeWritten(
   graph: GraphAccess,
@@ -160,7 +181,18 @@ export async function judgeWritten(
   caps: ReadonlyMap<string, ops.RelationCap> | null,
   writtenAt: Date,
 ): Promise<InsertWarning[]> {
-  const chosen = await graph.read((store, ns) => askJudge(store, ns, llm, written, caps, writtenAt));
+  let chosen: Array<readonly [Relation, EdgeRow]>;
+  try {
+    chosen = await graph.read((store, ns) => askJudge(store, ns, llm, written, caps, writtenAt));
+  } catch (exc) {
+    const unjudged = [
+      ...new Set(written.filter((r) => r.created_at.getTime() === writtenAt.getTime()).map((r) => r.id)),
+    ]
+      .sort(comparePy)
+      .join(", ");
+    const message = `the LLM contradiction judge failed, so ${unjudged} were not judged: ${summarizeError(exc)}`;
+    return [insertWarning("contradiction_not_judged", message)];
+  }
   if (!chosen.length) return [];
   return graph.write((tx, ns) => applyVerdicts(tx, ns, chosen, new Date()));
 }
