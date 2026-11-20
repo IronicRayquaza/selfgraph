@@ -13,7 +13,7 @@ from ._diff import graph_diff
 from ._export import obsidian_vault
 from ._maintenance import inspect, scan_entities, scan_relations
 from ._serde import L_TRACE, aware, now
-from .contradiction import judge_contradictions
+from .contradiction import apply_verdicts, ask_judge
 from .errors import CLOSED_MESSAGE, StoreError, TransientError, ValidationError, needs_llm
 from .extraction.extractor import LLMExtractor
 from .extraction.prompts import check_prompts
@@ -34,6 +34,7 @@ from .models import (
     JsonValue,
     LLMConfig,
     Readiness,
+    Relation,
     RetrievalResult,
     SourceDiff,
     as_input,
@@ -43,6 +44,7 @@ from .protocols import Embedder, Extractor, GraphStore, LLMClient
 from .provenance import record_source
 from .resolution import (
     EntityResolver,
+    LLMResolver,
     ResolverMode,
     as_resolver,
     merge_warnings,
@@ -552,16 +554,32 @@ class SelfGraph:
         async def create(tx: Any) -> Any:
             found.clear()
             check = self._schema_check
-            rel = await _ops.create_relation(
+            return await _ops.create_relation(
                 tx, self.namespace, **fields, schema_check=check, contradiction=mode, caps=caps, warnings=found
             )
-            if judged and self._llm is not None:
-                found.extend(await judge_contradictions(tx, self.namespace, self._llm, [rel], caps, rel.created_at))
-            return rel
 
         rel = await self._in_tx(create)
+        if judged and self._llm is not None:
+            found.extend(await self._judge([rel], caps, rel.created_at))
         log_schema_warnings(found)
         return rel
+
+    async def _judge(self, written: list[Relation], caps: dict[str, Any], written_at: datetime) -> list[InsertWarning]:
+        """Ask the LLM judge about relations a committed write stored, then retire what it chose in a short write.
+
+        The LLM is asked outside any transaction, so no lock is held while it answers and a retried write never asks
+        again; the write that retires reads each verdict's relations again under their locks (see apply_verdicts).
+
+        @param written (list[Relation]): the relations the write stored.
+        @param caps (dict[str, Any]): the schema's max_count limits by relation type.
+        @param written_at (datetime): the write's timestamp; only relations it created or revised are judged.
+        @return (list[InsertWarning]): the judge's relation_superseded and certified_kept warnings.
+        """
+        reader = await self._reader()
+        chosen = await ask_judge(reader, self.namespace, self._llm, written, caps, written_at)  # type: ignore[arg-type]
+        if not chosen:
+            return []
+        return await self._in_tx(lambda tx: apply_verdicts(tx, self.namespace, chosen, now()))
 
     def _build_extractor(
         self,
@@ -621,6 +639,12 @@ class SelfGraph:
         used = {"resolution": resolver_tier, "contradiction": "llm" if judged else conflicts}
         if extraction is not None:
             used = {"extraction": extraction, **used}
+
+        if isinstance(active_resolver, LLMResolver):
+            _ops._require_datetime("event_time", default_event_time)
+            reader = await self._reader()
+            ahead = await _ops.validate_facts(reader, ns, facts, rewrite=lambda o: canonicalize_types(o, active_schema))
+            active_resolver = await active_resolver.ask_ahead(reader, ns, ahead, active_schema, created_at)
 
         async def _apply(tx: Any) -> InsertResult:
             _ops._require_datetime("event_time", default_event_time)
@@ -685,8 +709,6 @@ class SelfGraph:
                 warnings=found,
                 via=None if resolution is None else [[resolution.statements(rel)] * len(ev) for rel, ev in items],
             )
-            if judged and self._llm is not None:
-                found.extend(await judge_contradictions(tx, ns, self._llm, relations, caps, created_at))
 
             diff = None
             if replace_source and source_id is not None and source_version is not None:
@@ -761,4 +783,8 @@ class SelfGraph:
                 source_diff=diff,
             )
 
-        return await self._in_tx(_apply)
+        result = await self._in_tx(_apply)
+        if judged and self._llm is not None:
+            notes = await self._judge(result.relations, caps, created_at)
+            result.warnings += [w.model_copy(update={"source_id": source_id}) for w in notes]
+        return result

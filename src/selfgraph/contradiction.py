@@ -11,7 +11,7 @@ from ._serde import L_ENTITY, decode_entity
 from .models import InsertWarning, Relation
 from .protocols import LLMClient
 
-__all__ = ["judge_contradictions"]
+__all__ = ["ask_judge", "apply_verdicts"]
 
 _MAX_RIVALS = 20
 _SYSTEM = (
@@ -39,30 +39,30 @@ def _line(edge_type: str, source: str, target: str, properties: Mapping[str, Any
     return f"{source} -[{edge_type}]-> {target}{props}"
 
 
-async def judge_contradictions(
+async def ask_judge(
     runner: Any,
     ns: str,
     llm: LLMClient,
     written: list[Relation],
     caps: Mapping[str, _ops.RelationCap] | None,
-    known: datetime,
-) -> list[InsertWarning]:
-    """Ask the LLM which older relations each written relation makes untrue, and retire those.
+    written_at: datetime,
+) -> list[tuple[Relation, dict]]:
+    """Ask the LLM which older relations each written relation makes untrue, without writing anything.
 
     Only relations the cardinality rules left alone are judged: one call per written relation that has a rival
-    (see _ops.rival_relations). A retired relation is invalidated by the written one at its effective time. A
-    certified relation is never retired, as with the cardinality rules.
+    (see _ops.rival_relations). It runs after the write commits and outside any transaction, so no lock is held
+    while the LLM answers and a retried write never asks again; apply_verdicts then retires what it chose.
 
     @param runner (Any): graph runner.
     @param ns (str): namespace.
     @param llm (LLMClient): the LLM to ask.
     @param written (list[Relation]): the relations a write just stored.
     @param caps (Mapping[str, RelationCap] | None): the schema's max_count limits by relation type.
-    @param known (datetime): the timestamp of the write, stamped on each retirement.
-    @return (list[InsertWarning]): one relation_superseded warning per retired relation, and one certified_kept warning
-        per certified relation the LLM judged contradicted, which stays current.
+    @param written_at (datetime): the write's timestamp; only relations it created or revised are judged.
+    @return (list[tuple[Relation, dict]]): each written relation, as judged, with a rival edge row the LLM judged it
+        contradicts.
     """
-    by_id = {r.id: r for r in written if r.created_at == known}
+    by_id = {r.id: r for r in written if r.created_at == written_at}
     if not by_id:
         return []
     rivals = await _ops.rival_relations(runner, ns, written, caps, _MAX_RIVALS)
@@ -77,8 +77,7 @@ async def judge_contradictions(
     def name(eid: str) -> str:
         return names.get(eid, eid)
 
-    retirements: list[tuple[dict, str, datetime]] = []
-    kept: list[InsertWarning] = []
+    chosen: list[tuple[Relation, dict]] = []
     taken: set[str] = set()
     for rid, edges in rivals.items():
         new = by_id[rid]
@@ -100,14 +99,47 @@ async def judge_contradictions(
             if 1 <= number <= len(open_edges):
                 edge = open_edges[number - 1]
                 taken.add(edge["props"]["id"])
-                if edge["props"].get("certified_at") is None:
-                    retirements.append((edge, new.id, _ops.effective_time(new)))
-                    continue
-                message = (
-                    f"relation {edge['props']['id']} is certified, so it stays current though the LLM judged "
-                    f"{rid} to contradict it"
-                )
-                kept.append(InsertWarning(code="certified_kept", message=message))
+                chosen.append((new, edge))
+    return chosen
+
+
+async def apply_verdicts(
+    runner: Any, ns: str, chosen: list[tuple[Relation, dict]], known: datetime
+) -> list[InsertWarning]:
+    """Retire the older relations the judge chose, each read again with its written relation under their source locks.
+
+    A verdict is stale, and left alone, when the rival or the written relation is gone, no longer current, or has
+    another revision than the one judged. A retired relation is invalidated by the written relation at its effective
+    time. A certified relation is never retired, as with the cardinality rules.
+
+    @param runner (Any): graph runner.
+    @param ns (str): namespace.
+    @param chosen (list[tuple[Relation, dict]]): each written relation with a rival edge row, as ask_judge returns.
+    @param known (datetime): the timestamp of this write, stamped on each retirement.
+    @return (list[InsertWarning]): one relation_superseded warning per retired relation, and one certified_kept warning
+        per certified relation the LLM judged contradicted, which stays current.
+    """
+    sources = (eid for asked, edge in chosen for eid in (asked.from_entity, edge["from_id"]))
+    for source in sorted(_ops._dedup_list(sources)):
+        await runner.lock_node(ns, L_ENTITY, source)
+    retirements: list[tuple[dict, str, datetime]] = []
+    kept: list[InsertWarning] = []
+    for asked, judged in chosen:
+        rid = asked.id
+        new = await _ops.get_relation_current(runner, ns, rid)
+        edge = await runner.get_current_edge(ns, judged["props"]["id"])
+        if new is None or new.revision != asked.revision:
+            continue
+        if edge is None or _ops._revision(edge) != _ops._revision(judged):
+            continue
+        if edge["props"].get("certified_at") is None:
+            retirements.append((edge, rid, _ops.effective_time(new)))
+            continue
+        message = (
+            f"relation {edge['props']['id']} is certified, so it stays current though the LLM judged "
+            f"{rid} to contradict it"
+        )
+        kept.append(InsertWarning(code="certified_kept", message=message))
     retired = await _ops.retire_relations(runner, ns, retirements, known)
     return kept + [
         InsertWarning(

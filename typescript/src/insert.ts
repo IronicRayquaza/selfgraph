@@ -1,5 +1,5 @@
 import type { GraphAccess } from "./access.js";
-import { judgeContradictions } from "./contradiction.js";
+import { judgeWritten } from "./contradiction.js";
 import { ExtractionError, errorMessage, SelfGraphError, ValidationError } from "./errors.js";
 import { NERExtractor } from "./extraction/basic.js";
 import { LLMExtractor } from "./extraction/extractor.js";
@@ -32,6 +32,7 @@ import type { Extractor, LLMClient } from "./protocols.js";
 import { recordSource } from "./provenance.js";
 import {
   type EntityResolver,
+  LLMResolver,
   mergeWarnings,
   planResolution,
   type ResolverMode,
@@ -229,12 +230,22 @@ export class Insert {
       resolution: resolverTier,
       contradiction: judged ? "llm" : conflicts,
     };
-    return this.graph.write(async (tx, ns) => {
+    const writeResolver =
+      activeResolver instanceof LLMResolver
+        ? await this.graph.read(async (store, ns) =>
+            activeResolver.askAhead(
+              store,
+              ns,
+              await ops.validateFacts(store, ns, facts, (o) => canonicalizeTypes(o, activeSchema)),
+              activeSchema,
+              createdAt,
+            ),
+          )
+        : activeResolver;
+    const result = await this.graph.write(async (tx, ns) => {
       const canonical = await ops.validateFacts(tx, ns, facts, (o) => canonicalizeTypes(o, activeSchema));
       let resolution =
-        activeResolver === null
-          ? null
-          : await planResolution(tx, ns, canonical, activeResolver, activeSchema, createdAt);
+        writeResolver === null ? null : await planResolution(tx, ns, canonical, writeResolver, activeSchema, createdAt);
       let resolved = resolution?.facts ?? canonical;
       let dropped: InsertWarning[] = [];
       if (extracted && mode === "strict") {
@@ -282,9 +293,6 @@ export class Insert {
         warnings: found,
         ...(via ? { via } : {}),
       });
-      if (judged && llm !== null) {
-        found.push(...(await judgeContradictions(tx, ns, llm, relations, caps, createdAt)));
-      }
 
       let diff: SourceDiff | null = null;
       if (source.replace_source && source.source_id !== null && sourceVersion !== null) {
@@ -353,6 +361,11 @@ export class Insert {
         source_diff: diff,
       };
     });
+    if (judged && llm !== null) {
+      const notes = await judgeWritten(this.graph, llm, result.relations, caps, createdAt);
+      result.warnings.push(...notes.map((w) => ({ ...w, source_id: source.source_id })));
+    }
+    return result;
   }
 
   private async extract(extractor: Extractor, document: ParsedDocument): Promise<ParsedExtraction> {
