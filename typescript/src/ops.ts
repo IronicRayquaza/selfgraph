@@ -3330,14 +3330,13 @@ export async function sourceTargets(runner: Runner, ns: string, sourceId: string
 /**
  * Retire relations an insert left out of its source replacement, under the source's current version.
  *
- * The source is locked first, so a newer replacement of the same source either committed before this read or waits for this write. When one committed, the insert's version is no longer current and is not made current again: the relations are retired under the version that replaced it, which never saw them, since they rest only on versions already replaced, and are known retired no earlier than that version was written. When that version was itself replaced, its replaced_by is followed to the version still current. Another version written meanwhile without replace_source does not block the retirement, though it is current too.
+ * The source is locked first, so a newer replacement of the same source either committed before this read or waits for this write. When one committed, the insert's version is no longer current and is not made current again: the relations are retired under the version that replaced it, which never saw them, since they rest only on versions already replaced, and are known retired no earlier than that version was written. When that version was itself replaced, its replaced_by is followed to the version still current. No version is marked replaced here: the insert's own write marked the versions it saw, and a version written since keeps the relations it states current.
  *
  * @param runner (Runner): the graph runner.
  * @param ns (string): the namespace.
  * @param sourceId (string): the source id.
  * @param version (string): the source version the insert recorded.
  * @param stale (Iterable<string>): the relation ids to retire, as replaceSource takes them.
- * @param at (Date): the insert's effective time.
  * @param known (Date): the timestamp of the insert that recorded the version.
  * @return ([string[], InsertWarning[]]): the retired relation ids and warnings, as replaceSource returns.
  */
@@ -3347,29 +3346,28 @@ export async function replaceSourceLate(
   sourceId: string,
   version: string,
   stale: Iterable<string>,
-  at: Date,
   known: Date,
 ): Promise<[string[], InsertWarning[]]> {
   const node = ids.sourceNodeId(sourceId);
   await runner.lockNode(ns, L_SOURCE, node);
-  const stored = await runner.getNode(ns, L_SOURCE_VERSION, version);
-  if (stored === null) return [[], []];
-  if ((stored.replaced_by ?? null) !== null) {
-    const rows = await runner.childNodes(ns, L_SOURCE, node, R_HAS_VERSION, L_SOURCE_VERSION);
-    const byId = new Map(rows.map((row) => [row.id as string, row]));
-    const chain = [version];
-    for (;;) {
-      const step = (byId.get(chain[chain.length - 1]!)?.replaced_by ?? null) as string | null;
-      if (step === null || chain.includes(step)) break;
-      chain.push(step);
-    }
-    const current = byId.get(chain[chain.length - 1]!);
-    if (current === undefined || (current.replaced_by ?? null) !== null) return [[], []];
+  const rows = await runner.childNodes(ns, L_SOURCE, node, R_HAS_VERSION, L_SOURCE_VERSION);
+  const byId = new Map(rows.map((row) => [row.id as string, row]));
+  const chain = [version];
+  for (;;) {
+    const step = (byId.get(chain[chain.length - 1]!)?.replaced_by ?? null) as string | null;
+    if (step === null || chain.includes(step)) break;
+    chain.push(step);
+  }
+  const current = byId.get(chain[chain.length - 1]!);
+  if (current === undefined || (current.replaced_by ?? null) !== null) return [[], []];
+  if (current.id !== version) {
     version = current.id as string;
     const written = fromIso(current.created_at as string)!;
     if (written.getTime() > known.getTime()) known = written;
   }
-  return replaceSource(runner, ns, sourceId, version, stale, at, known);
+  const live = new Set(rows.filter((row) => (row.replaced_by ?? null) === null).map((row) => row.id as string));
+  const effective = fromIso((current.event_time ?? current.created_at) as string)!;
+  return retireUnsupported(runner, ns, sourceId, live, version, stale, effective, known);
 }
 
 /**
@@ -3404,42 +3402,16 @@ export async function replaceSource(
   if (stored !== null && (stored.replaced_by ?? null) === null) {
     at = fromIso((stored.event_time ?? stored.created_at) as string)!;
   }
-  const candidates = [...new Set(stale)].sort(comparePy);
-  const support = new Map<string, Props[]>();
-  for (const row of await nodesWhere(runner, ns, L_EVIDENCE, "target_id", candidates)) {
-    const target = row.target_id as string;
-    support.set(target, [...(support.get(target) ?? []), row]);
-  }
-  const others = dedupList(
-    [...support.values()]
-      .flat()
-      .filter((r) => r.source_id !== sourceId)
-      .map((r) => r.source_version as string),
+  const [retired, warnings] = await retireUnsupported(
+    runner,
+    ns,
+    sourceId,
+    new Set([version]),
+    version,
+    stale,
+    at,
+    known,
   );
-  const replaced = new Set(
-    [...(await nodesById(runner, ns, L_SOURCE_VERSION, others))].filter(([, row]) => row.replaced_by).map(([sv]) => sv),
-  );
-  const active = (r: Props): boolean =>
-    r.source_version === `${r.source_id}:manual` ||
-    (r.source_id === sourceId ? r.source_version === version : !replaced.has(r.source_version as string));
-  const retired: string[] = [];
-  const retirements: Array<readonly [EdgeRow, string, Date]> = [];
-  const warnings: InsertWarning[] = [];
-  for (const rid of candidates) {
-    if ((support.get(rid) ?? []).some(active)) continue;
-    const edge = await runner.getCurrentEdge(ns, rid);
-    if (edge === null || !isRelationType(edge.type)) continue;
-    if (edge.props.certified_at !== null && edge.props.certified_at !== undefined) {
-      const message = `relation ${rid} is certified, so it stays current though source ${sourceId} no longer states it`;
-      warnings.push(insertWarning("certified_kept", message));
-      continue;
-    }
-    retirements.push([edge, version, at]);
-    retired.push(rid);
-    const message = `relation ${rid} was retired: only older versions of source ${sourceId} stated it`;
-    warnings.push(insertWarning("fact_retired_by_source", message));
-  }
-  await retireRelations(runner, ns, retirements, known);
   const knownAt = toIso(known);
   const marks: NodeRow[] = [];
   for (const row of await runner.childNodes(
@@ -3465,6 +3437,68 @@ export async function replaceSource(
     }
   }
   if (marks.length) await runner.upsertNodes(ns, L_SOURCE_VERSION, marks);
+  return [retired, warnings];
+}
+
+/**
+ * Retire the current relations among stale with no evidence from a live version of the source or another source.
+ *
+ * @param runner (Runner): the graph runner.
+ * @param ns (string): the namespace.
+ * @param sourceId (string): the source id.
+ * @param live (Set<string>): the versions of this source whose evidence keeps a relation current.
+ * @param version (string): the version stored as invalidated_by.
+ * @param stale (Iterable<string>): the candidate relation ids.
+ * @param at (Date): the retirement's effective time.
+ * @param known (Date): when the retirement is known.
+ * @return ([string[], InsertWarning[]]): the retired relation ids, and one warning per decision.
+ */
+async function retireUnsupported(
+  runner: Runner,
+  ns: string,
+  sourceId: string,
+  live: Set<string>,
+  version: string,
+  stale: Iterable<string>,
+  at: Date,
+  known: Date,
+): Promise<[string[], InsertWarning[]]> {
+  const candidates = [...new Set(stale)].sort(comparePy);
+  const support = new Map<string, Props[]>();
+  for (const row of await nodesWhere(runner, ns, L_EVIDENCE, "target_id", candidates)) {
+    const target = row.target_id as string;
+    support.set(target, [...(support.get(target) ?? []), row]);
+  }
+  const others = dedupList(
+    [...support.values()]
+      .flat()
+      .filter((r) => r.source_id !== sourceId)
+      .map((r) => r.source_version as string),
+  );
+  const replaced = new Set(
+    [...(await nodesById(runner, ns, L_SOURCE_VERSION, others))].filter(([, row]) => row.replaced_by).map(([sv]) => sv),
+  );
+  const active = (r: Props): boolean =>
+    r.source_version === `${r.source_id}:manual` ||
+    (r.source_id === sourceId ? live.has(r.source_version as string) : !replaced.has(r.source_version as string));
+  const retired: string[] = [];
+  const retirements: Array<readonly [EdgeRow, string, Date]> = [];
+  const warnings: InsertWarning[] = [];
+  for (const rid of candidates) {
+    if ((support.get(rid) ?? []).some(active)) continue;
+    const edge = await runner.getCurrentEdge(ns, rid);
+    if (edge === null || !isRelationType(edge.type)) continue;
+    if (edge.props.certified_at !== null && edge.props.certified_at !== undefined) {
+      const message = `relation ${rid} is certified, so it stays current though source ${sourceId} no longer states it`;
+      warnings.push(insertWarning("certified_kept", message));
+      continue;
+    }
+    retirements.push([edge, version, at]);
+    retired.push(rid);
+    const message = `relation ${rid} was retired: only older versions of source ${sourceId} stated it`;
+    warnings.push(insertWarning("fact_retired_by_source", message));
+  }
+  await retireRelations(runner, ns, retirements, known);
   return [retired, warnings];
 }
 

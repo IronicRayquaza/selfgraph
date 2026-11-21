@@ -641,44 +641,53 @@ function suite(spec: StoreSpec): void {
     );
   });
 
-  it.each(["globex", "initech"])(
-    "follows a deferred source replacement past a version appended while both wait (%s first)",
-    async (first) => {
-      const g = open({ extraction: "regex" });
-      await g.insert.text("Ann works at Acme.", { source_id: "hr" });
-      const judges = { globex: new PausedJudge(), initech: new PausedJudge() };
-      const tasks: Record<string, Promise<InsertResult>> = {};
-      for (const company of ["globex", "initech"] as const) {
-        const graph = new SelfGraph(g.store, {
-          namespace: g.namespace,
-          extraction: "regex",
-          llm: judges[company],
-          contradiction: "llm",
-        });
-        const text = `Ann works at ${company[0]!.toUpperCase()}${company.slice(1)}.`;
-        tasks[company] = graph.insert.text(text, { source_id: "hr", replace_source: true });
-        await judges[company].asked;
-      }
-      await g.insert.text("Bob works at Paris.", { source_id: "hr" });
-      for (const company of first === "globex" ? (["globex", "initech"] as const) : (["initech", "globex"] as const)) {
-        judges[company].release();
-        await tasks[company];
-      }
-      const initech = await tasks.initech!;
-      expect((await g.relations.list()).items.map((r) => r.to_entity).sort()).toEqual(["thing:initech", "thing:paris"]);
+  const appended = [
+    ["globex", false],
+    ["globex", true],
+    ["initech", false],
+    ["initech", true],
+  ] as const;
+  it.each(appended)("folds a deferred replacement past an append: %s first, restated %s", async (first, restated) => {
+    const g = open({ extraction: "regex" });
+    await g.insert.text("Ann works at Acme.", { source_id: "hr" });
+    const judges = { globex: new PausedJudge(), initech: new PausedJudge() };
+    const tasks: Record<string, Promise<InsertResult>> = {};
+    for (const company of ["globex", "initech"] as const) {
+      const graph = new SelfGraph(g.store, {
+        namespace: g.namespace,
+        extraction: "regex",
+        llm: judges[company],
+        contradiction: "llm",
+      });
+      const text = `Ann works at ${company[0]!.toUpperCase()}${company.slice(1)}.`;
+      tasks[company] = graph.insert.text(text, { source_id: "hr", replace_source: true });
+      await judges[company].asked;
+    }
+    const text = restated ? "Ann works at Acme. Bob works at Paris." : "Bob works at Paris.";
+    const append = await g.insert.text(text, { source_id: "hr" });
+    for (const company of first === "globex" ? (["globex", "initech"] as const) : (["initech", "globex"] as const)) {
+      judges[company].release();
+      await tasks[company];
+    }
+    const initech = await tasks.initech!;
+    const current = (await g.relations.list()).items.map((r) => r.to_entity).sort();
+    expect(current).toEqual(
+      restated ? ["thing:acme", "thing:initech", "thing:paris"] : ["thing:initech", "thing:paris"],
+    );
+    const versions = await g.store.matchNodes(g.namespace, "SourceVersion");
+    const replacedBy = (id: string | null) => versions.find((v) => v.id === id)!.replaced_by ?? null;
+    expect([replacedBy(initech.source_version), replacedBy(append.source_version)]).toEqual([null, null]);
+    if (!restated) {
       const acme = (await g.relations.list({ include_invalidated: true })).items.find(
         (r) => r.to_entity === "thing:acme",
       );
       expect(acme!.invalidated_by).toBe(initech.source_version);
-      const stored = (await g.store.matchNodes(g.namespace, "SourceVersion")).find(
-        (v) => v.id === initech.source_version,
-      );
-      expect(stored!.replaced_by ?? null).toBeNull();
+      const stored = versions.find((v) => v.id === initech.source_version)!;
       expect(acme!.invalidated_known_at!.getTime()).toBeGreaterThanOrEqual(
-        new Date(stored!.created_at as string).getTime(),
+        new Date(stored.created_at as string).getTime(),
       );
-    },
-  );
+    }
+  });
 
   it.each(["insert", "create"])("warns instead of failing a committed write when the judge fails (%s)", async (via) => {
     const failing: LLMClient = {

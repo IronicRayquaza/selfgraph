@@ -680,8 +680,9 @@ class PausedJudge:
         return output(retired=[])
 
 
+@pytest.mark.parametrize("restated", [False, True])
 @pytest.mark.parametrize("first", ["globex", "initech"])
-def test_a_deferred_source_replacement_follows_the_newer_one_past_a_version_appended_while_both_wait(first):
+def test_a_deferred_source_replacement_follows_the_newer_one_past_a_version_appended_while_both_wait(first, restated):
     g = fresh_graph("tier", extraction="regex")
     run(g.insert.text("Ann works at Acme.", source_id="hr"))
     judges = {"globex": PausedJudge(), "initech": PausedJudge()}
@@ -694,20 +695,23 @@ def test_a_deferred_source_replacement_follows_the_newer_one_past_a_version_appe
             text = f"Ann works at {company.capitalize()}."
             tasks[company] = asyncio.ensure_future(graph.insert.text(text, source_id="hr", replace_source=True))
             await asyncio.wait_for(judges[company].asked.wait(), timeout=5)
-        await g.insert.text("Bob works at Paris.", source_id="hr")
+        text = "Ann works at Acme. Bob works at Paris." if restated else "Bob works at Paris."
+        appended = await g.insert.text(text, source_id="hr")
         for company in (first, ({"globex", "initech"} - {first}).pop()):
             judges[company].release.set()
             await tasks[company]
-        return await tasks["initech"]
+        return await tasks["initech"], appended
 
-    initech = run(scenario())
+    initech, appended = run(scenario())
     current = {r.to_entity for r in run(g.relations.list()).items}
-    assert current == {"thing:initech", "thing:paris"}
-    [acme] = [r for r in run(g.relations.list(include_invalidated=True)).items if r.to_entity == "thing:acme"]
-    assert acme.invalidated_by == initech.source_version
-    stored = {v["id"]: v for v in run(g.store.match_nodes(g.namespace, "SourceVersion"))}
-    assert stored[initech.source_version].get("replaced_by") is None
-    assert acme.invalidated_known_at >= datetime.fromisoformat(stored[initech.source_version]["created_at"])
+    assert current == {"thing:initech", "thing:paris"} | ({"thing:acme"} if restated else set())
+    stored = {v["id"]: v.get("replaced_by") for v in run(g.store.match_nodes(g.namespace, "SourceVersion"))}
+    assert (stored[initech.source_version], stored[appended.source_version]) == (None, None)
+    if not restated:
+        [acme] = [r for r in run(g.relations.list(include_invalidated=True)).items if r.to_entity == "thing:acme"]
+        assert acme.invalidated_by == initech.source_version
+        [row] = [v for v in run(g.store.match_nodes(g.namespace, "SourceVersion")) if v["id"] == initech.source_version]
+        assert acme.invalidated_known_at >= datetime.fromisoformat(row["created_at"])
 
 
 class FailingJudge:

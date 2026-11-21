@@ -804,9 +804,9 @@ class SelfGraph:
             notes = await self._judge(result.relations, caps, created_at)
             log_schema_warnings([w for w in notes if w.code == "contradiction_not_judged"])
             if deferred and result.source_diff is not None and result.source_version is not None:
-                version, at = result.source_version, aware(default_event_time or created_at)
+                version = result.source_version
                 retired, replaced = await self._in_tx(
-                    lambda tx: _ops.replace_source_late(tx, ns, source_id, version, deferred, at, created_at)
+                    lambda tx: _ops.replace_source_late(tx, ns, source_id, version, deferred, created_at)
                 )
                 result.source_diff.retired = sorted({*result.source_diff.retired, *retired})
                 notes += replaced

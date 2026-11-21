@@ -379,9 +379,8 @@ export class Insert {
       const sourceId = source.source_id;
       const version = result.source_version;
       if (deferred.length && result.source_diff && sourceId !== null && version !== null) {
-        const at = source.default_event_time ?? createdAt;
         const [retired, replaced] = await this.graph.write((tx, ns) =>
-          ops.replaceSourceLate(tx, ns, sourceId, version, deferred, at, createdAt),
+          ops.replaceSourceLate(tx, ns, sourceId, version, deferred, createdAt),
         );
         result.source_diff.retired = [...new Set([...result.source_diff.retired, ...retired])].sort(comparePy);
         notes.push(...replaced);

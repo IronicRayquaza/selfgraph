@@ -3178,38 +3178,7 @@ async def replace_source(
     stored = await runner.get_node(ns, L_SOURCE_VERSION, version)
     if stored is not None and stored.get("replaced_by") is None:
         at = aware(from_iso(stored.get("event_time") or stored["created_at"]))
-    candidates = sorted(set(stale))
-    support: dict[str, list[dict]] = {}
-    for row in await _nodes_where(runner, ns, L_EVIDENCE, "target_id", candidates):
-        support.setdefault(row["target_id"], []).append(row)
-    others = _dedup_list(r["source_version"] for rows in support.values() for r in rows if r["source_id"] != source_id)
-    replaced = {
-        sv for sv, row in (await _nodes_by_id(runner, ns, L_SOURCE_VERSION, others)).items() if row.get("replaced_by")
-    }
-
-    def active(r: dict) -> bool:
-        if r["source_version"] == f"{r['source_id']}:manual":
-            return True
-        return r["source_version"] == version if r["source_id"] == source_id else r["source_version"] not in replaced
-
-    retired: list[str] = []
-    retirements: list[tuple[dict, str, datetime]] = []
-    warnings: list[InsertWarning] = []
-    for rid in candidates:
-        if any(map(active, support.get(rid, []))):
-            continue
-        edge = await runner.get_current_edge(ns, rid)
-        if edge is None or not _is_relation_type(edge["type"]):
-            continue
-        if edge["props"].get("certified_at") is not None:
-            message = f"relation {rid} is certified, so it stays current though source {source_id} no longer states it"
-            warnings.append(InsertWarning(code="certified_kept", message=message))
-            continue
-        retirements.append((edge, version, at))
-        retired.append(rid)
-        message = f"relation {rid} was retired: only older versions of source {source_id} stated it"
-        warnings.append(InsertWarning(code="fact_retired_by_source", message=message))
-    await retire_relations(runner, ns, retirements, known)
+    retired, warnings = await _retire_unsupported(runner, ns, source_id, {version}, version, stale, at, known)
     known_at = to_iso(known)
     marks = []
     for row in await runner.child_nodes(ns, L_SOURCE, _ids.source_node_id(source_id), R_HAS_VERSION, L_SOURCE_VERSION):
@@ -3229,8 +3198,65 @@ async def replace_source(
     return retired, warnings
 
 
+async def _retire_unsupported(
+    runner: Any,
+    ns: str,
+    source_id: str,
+    live: set[str],
+    version: str,
+    stale: Iterable[str],
+    at: datetime,
+    known: datetime,
+) -> tuple[list[str], list[InsertWarning]]:
+    """Retire the current relations among stale with no evidence from a live version of the source or another source.
+
+    @param runner (Any): graph runner.
+    @param ns (str): namespace.
+    @param source_id (str): the source id.
+    @param live (set[str]): the versions of this source whose evidence keeps a relation current.
+    @param version (str): the version stored as invalidated_by.
+    @param stale (Iterable[str]): the candidate relation ids.
+    @param at (datetime): the retirement's effective time.
+    @param known (datetime): when the retirement is known.
+    @return (tuple[list[str], list[InsertWarning]]): the retired relation ids, and one warning per decision.
+    """
+    candidates = sorted(set(stale))
+    support: dict[str, list[dict]] = {}
+    for row in await _nodes_where(runner, ns, L_EVIDENCE, "target_id", candidates):
+        support.setdefault(row["target_id"], []).append(row)
+    others = _dedup_list(r["source_version"] for rows in support.values() for r in rows if r["source_id"] != source_id)
+    replaced = {
+        sv for sv, row in (await _nodes_by_id(runner, ns, L_SOURCE_VERSION, others)).items() if row.get("replaced_by")
+    }
+
+    def active(r: dict) -> bool:
+        if r["source_version"] == f"{r['source_id']}:manual":
+            return True
+        return r["source_version"] in live if r["source_id"] == source_id else r["source_version"] not in replaced
+
+    retired: list[str] = []
+    retirements: list[tuple[dict, str, datetime]] = []
+    warnings: list[InsertWarning] = []
+    for rid in candidates:
+        if any(map(active, support.get(rid, []))):
+            continue
+        edge = await runner.get_current_edge(ns, rid)
+        if edge is None or not _is_relation_type(edge["type"]):
+            continue
+        if edge["props"].get("certified_at") is not None:
+            message = f"relation {rid} is certified, so it stays current though source {source_id} no longer states it"
+            warnings.append(InsertWarning(code="certified_kept", message=message))
+            continue
+        retirements.append((edge, version, at))
+        retired.append(rid)
+        message = f"relation {rid} was retired: only older versions of source {source_id} stated it"
+        warnings.append(InsertWarning(code="fact_retired_by_source", message=message))
+    await retire_relations(runner, ns, retirements, known)
+    return retired, warnings
+
+
 async def replace_source_late(
-    runner: Any, ns: str, source_id: str, version: str, stale: Iterable[str], at: datetime, known: datetime
+    runner: Any, ns: str, source_id: str, version: str, stale: Iterable[str], known: datetime
 ) -> tuple[list[str], list[InsertWarning]]:
     """Retire relations an insert left out of its source replacement, under the source's current version.
 
@@ -3238,34 +3264,32 @@ async def replace_source_late(
     for this write. When one committed, the insert's version is no longer current and is not made current again: the
     relations are retired under the version that replaced it, which never saw them, since they rest only on versions
     already replaced, and are known retired no earlier than that version was written. When that version was itself
-    replaced, its replaced_by is followed to the version still current. Another version written meanwhile without
-    replace_source does not block the retirement, though it is current too.
+    replaced, its replaced_by is followed to the version still current. No version is marked replaced here: the
+    insert's own write marked the versions it saw, and a version written since keeps the relations it states current.
 
     @param runner (Any): graph runner.
     @param ns (str): namespace.
     @param source_id (str): the source id.
     @param version (str): the source version the insert recorded.
     @param stale (Iterable[str]): the relation ids to retire, as replace_source takes them.
-    @param at (datetime): the insert's effective time.
     @param known (datetime): the timestamp of the insert that recorded the version.
     @return (tuple[list[str], list[InsertWarning]]): the retired relation ids and warnings, as replace_source returns.
     """
     await runner.lock_node(ns, L_SOURCE, _ids.source_node_id(source_id))
-    stored = await runner.get_node(ns, L_SOURCE_VERSION, version)
-    if stored is None:
+    rows = await runner.child_nodes(ns, L_SOURCE, _ids.source_node_id(source_id), R_HAS_VERSION, L_SOURCE_VERSION)
+    by_id = {row["id"]: row for row in rows}
+    chain = [version]
+    while (step := by_id.get(chain[-1], {}).get("replaced_by")) is not None and step not in chain:
+        chain.append(step)
+    current = by_id.get(chain[-1])
+    if current is None or current.get("replaced_by") is not None:
         return [], []
-    if stored.get("replaced_by") is not None:
-        rows = await runner.child_nodes(ns, L_SOURCE, _ids.source_node_id(source_id), R_HAS_VERSION, L_SOURCE_VERSION)
-        by_id = {row["id"]: row for row in rows}
-        chain = [version]
-        while (step := by_id.get(chain[-1], {}).get("replaced_by")) is not None and step not in chain:
-            chain.append(step)
-        current = by_id.get(chain[-1])
-        if current is None or current.get("replaced_by") is not None:
-            return [], []
+    if current["id"] != version:
         version = current["id"]
         known = max(known, aware(from_iso(current["created_at"])))
-    return await replace_source(runner, ns, source_id, version, stale, at, known)
+    at = aware(from_iso(current.get("event_time") or current["created_at"]))
+    live = {row["id"] for row in rows if row.get("replaced_by") is None}
+    return await _retire_unsupported(runner, ns, source_id, live, version, stale, at, known)
 
 
 async def _ensure_profile(runner: Any, ns: str, subject_id: str, created_at: datetime) -> str:
