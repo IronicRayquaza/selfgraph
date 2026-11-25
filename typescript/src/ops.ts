@@ -1508,7 +1508,7 @@ export async function edgesAt(
  * @param page (number): the rows to read per call.
  * @return (EdgeRow[]): the edge rows, in store order.
  */
-function allEdges(
+export function allEdges(
   runner: Runner,
   ns: string,
   filter: Omit<MatchEdgesOptions, "skip" | "limit">,
@@ -1765,7 +1765,7 @@ export async function withClaims<T>(write: () => Promise<T>): Promise<T> {
  * @param id (string): the relation or preference id.
  * @return (Claim): the record's holding attempts and times one found it current, and whether another may write it.
  */
-function takeClaim(runner: Runner, ns: string, id: string): Claim {
+export function takeClaim(runner: Runner, ns: string, id: string): Claim {
   const held = HELD.getStore()!;
   const states = CLAIMS.get(runner) ?? new Map<string, ClaimState>();
   CLAIMS.set(runner, states);
@@ -1788,7 +1788,7 @@ function takeClaim(runner: Runner, ns: string, id: string): Claim {
  * @param claim (Claim): the attempt's claim on the record, from takeClaim.
  * @return (void): nothing.
  */
-function foundCurrent(claim: Claim): void {
+export function foundCurrent(claim: Claim): void {
   claim.state.seen += 1;
 }
 
@@ -1800,7 +1800,7 @@ function foundCurrent(claim: Claim): void {
  * @param kind ("relation" | "preference"): the object kind, for the error.
  * @return (void): nothing; throws TransientError for a record another write may still be writing.
  */
-function requireUnshared(claim: Claim, id: string, kind: "relation" | "preference"): void {
+export function requireUnshared(claim: Claim, id: string, kind: "relation" | "preference"): void {
   if (claim.contended()) {
     throw new TransientError(`${kind} ${pyRepr(id)} has no current version right now (concurrent write); retry`);
   }
@@ -1839,7 +1839,7 @@ async function writeRelationVersion(
   return decodeRelation(props, ends);
 }
 
-const revisionOf = (e: EdgeRow): number => Math.trunc(Number(e.props.revision));
+export const revisionOf = (e: EdgeRow): number => Math.trunc(Number(e.props.revision));
 
 /**
  * Every stored version of a relation as an edge row, oldest first.
@@ -2773,6 +2773,7 @@ async function contradictionCheck(
  * @param written (readonly Relation[]): the relations a write just stored.
  * @param caps (ReadonlyMap<string, RelationCap> | null): the schema's max_count limits by relation type.
  * @param limit (number): the most rivals to list per relation, lowest id first.
+ * @param also (Iterable<string>): ids of other relations the same write stored, which are not rivals either.
  * @return (Map<string, EdgeRow[]>): each written relation id with a rival, mapped to the rivals' edge rows.
  */
 export async function rivalRelations(
@@ -2781,9 +2782,10 @@ export async function rivalRelations(
   written: readonly Relation[],
   caps: ReadonlyMap<string, RelationCap> | null,
   limit: number,
+  also: Iterable<string> = [],
 ): Promise<Map<string, EdgeRow[]>> {
   const fresh = written.filter((r) => r.is_current && !caps?.has(r.type));
-  const batch = new Set(written.map((r) => r.id));
+  const batch = new Set([...written.map((r) => r.id), ...also]);
   const current = new Map<string, EdgeRow[]>();
   for (const source of dedupList(fresh.map((r) => r.from_entity))) {
     const found = new Map<string, EdgeRow>();
@@ -3908,42 +3910,7 @@ export async function replaceSource(
   if (stored !== null && (stored.replaced_by ?? null) === null) {
     at = fromIso((stored.event_time ?? stored.created_at) as string)!;
   }
-  const candidates = [...new Set(stale)].sort(comparePy);
-  const support = new Map<string, Props[]>();
-  for (const row of await nodesWhere(runner, ns, L_EVIDENCE, "target_id", candidates)) {
-    const target = row.target_id as string;
-    support.set(target, [...(support.get(target) ?? []), row]);
-  }
-  const others = dedupList(
-    [...support.values()]
-      .flat()
-      .filter((r) => r.source_id !== sourceId)
-      .map((r) => r.source_version as string),
-  );
-  const replaced = new Set(
-    [...(await nodesById(runner, ns, L_SOURCE_VERSION, others))].filter(([, row]) => row.replaced_by).map(([sv]) => sv),
-  );
-  const active = (r: Props): boolean =>
-    r.source_version === `${r.source_id}:manual` ||
-    (r.source_id === sourceId ? r.source_version === version : !replaced.has(r.source_version as string));
-  const retired: string[] = [];
-  const retirements: Array<readonly [EdgeRow, string, Date]> = [];
-  const warnings: InsertWarning[] = [];
-  for (const rid of candidates) {
-    if ((support.get(rid) ?? []).some(active)) continue;
-    const edge = await runner.getCurrentEdge(ns, rid);
-    if (edge === null || !isRelationType(edge.type)) continue;
-    if (edge.props.certified_at !== null && edge.props.certified_at !== undefined) {
-      const message = `relation ${rid} is certified, so it stays current though source ${sourceId} no longer states it`;
-      warnings.push(insertWarning("certified_kept", message));
-      continue;
-    }
-    retirements.push([edge, version, at]);
-    retired.push(rid);
-    const message = `relation ${rid} was retired: only older versions of source ${sourceId} stated it`;
-    warnings.push(insertWarning("fact_retired_by_source", message));
-  }
-  await retireRelations(runner, ns, retirements, known);
+  const result = await retireUnsupported(runner, ns, sourceId, new Set([version]), version, stale, at, known);
   const knownAt = toIso(known);
   const marks: NodeRow[] = [];
   for (const row of await runner.childNodes(
@@ -3969,7 +3936,106 @@ export async function replaceSource(
     }
   }
   if (marks.length) await runner.upsertNodes(ns, L_SOURCE_VERSION, marks);
+  return result;
+}
+
+/**
+ * Retire the current relations among stale with no evidence from a live version of the source or another source.
+ *
+ * @param runner (Runner): the graph runner.
+ * @param ns (string): the namespace.
+ * @param sourceId (string): the source id.
+ * @param live (ReadonlySet<string>): the versions of this source whose evidence keeps a relation current.
+ * @param version (string): the version stored as invalidated_by.
+ * @param stale (Iterable<string>): the candidate relation ids.
+ * @param at (Date): the retirement's effective time.
+ * @param known (Date): when the retirement is known.
+ * @return ([string[], InsertWarning[]]): the retired relation ids, and one warning per decision.
+ */
+async function retireUnsupported(
+  runner: Runner,
+  ns: string,
+  sourceId: string,
+  live: ReadonlySet<string>,
+  version: string,
+  stale: Iterable<string>,
+  at: Date,
+  known: Date,
+): Promise<[string[], InsertWarning[]]> {
+  const candidates = [...new Set(stale)].sort(comparePy);
+  const support = new Map<string, Props[]>();
+  for (const row of await nodesWhere(runner, ns, L_EVIDENCE, "target_id", candidates)) {
+    const target = row.target_id as string;
+    support.set(target, [...(support.get(target) ?? []), row]);
+  }
+  const others = dedupList(
+    [...support.values()]
+      .flat()
+      .filter((r) => r.source_id !== sourceId)
+      .map((r) => r.source_version as string),
+  );
+  const replaced = new Set(
+    [...(await nodesById(runner, ns, L_SOURCE_VERSION, others))].filter(([, row]) => row.replaced_by).map(([sv]) => sv),
+  );
+  const active = (r: Props): boolean =>
+    r.source_version === `${r.source_id}:manual` ||
+    (r.source_id === sourceId ? live.has(r.source_version as string) : !replaced.has(r.source_version as string));
+  const retired: string[] = [];
+  const retirements: Array<readonly [EdgeRow, string, Date]> = [];
+  const warnings: InsertWarning[] = [];
+  for (const rid of candidates) {
+    if ((support.get(rid) ?? []).some(active)) continue;
+    const edge = await runner.getCurrentEdge(ns, rid);
+    if (edge === null || !isRelationType(edge.type)) continue;
+    if (edge.props.certified_at !== null && edge.props.certified_at !== undefined) {
+      const message = `relation ${rid} is certified, so it stays current though source ${sourceId} no longer states it`;
+      warnings.push(insertWarning("certified_kept", message));
+      continue;
+    }
+    retirements.push([edge, version, at]);
+    retired.push(rid);
+    const message = `relation ${rid} was retired: only older versions of source ${sourceId} stated it`;
+    warnings.push(insertWarning("fact_retired_by_source", message));
+  }
+  await retireRelations(runner, ns, retirements, known);
   return [retired, warnings];
+}
+
+/**
+ * Retire relations an insert left out of its source replacement, under the version still current, marking none.
+ *
+ * @param runner (Runner): the graph runner.
+ * @param ns (string): the namespace.
+ * @param sourceId (string): the source id.
+ * @param version (string): the source version the insert recorded.
+ * @param stale (Iterable<string>): the relation ids to retire, as replaceSource takes them.
+ * @param known (Date): when the retirement is known.
+ * @return ([string[], InsertWarning[]]): the retired relation ids and warnings, as replaceSource returns.
+ */
+export async function replaceSourceLate(
+  runner: Runner,
+  ns: string,
+  sourceId: string,
+  version: string,
+  stale: Iterable<string>,
+  known: Date,
+): Promise<[string[], InsertWarning[]]> {
+  await runner.lockNode(ns, L_SOURCE, ids.sourceNodeId(sourceId));
+  const rows = await runner.childNodes(ns, L_SOURCE, ids.sourceNodeId(sourceId), R_HAS_VERSION, L_SOURCE_VERSION);
+  const byId = new Map(rows.map((row) => [row.id as string, row]));
+  const chain = [version];
+  for (;;) {
+    const step = (byId.get(chain.at(-1)!)?.replaced_by ?? null) as string | null;
+    if (step === null || chain.includes(step)) break;
+    chain.push(step);
+  }
+  const current = byId.get(chain.at(-1)!);
+  if (current === undefined || (current.replaced_by ?? null) !== null) return [[], []];
+  const created = fromIso(current.created_at as string)!;
+  if (epochMicros(created) > epochMicros(known)) known = created;
+  const at = fromIso((current.event_time ?? current.created_at) as string)!;
+  const live = new Set(rows.filter((row) => (row.replaced_by ?? null) === null).map((row) => row.id as string));
+  return retireUnsupported(runner, ns, sourceId, live, current.id as string, stale, at, known);
 }
 
 /**

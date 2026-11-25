@@ -14,13 +14,13 @@ from ._diff import graph_diff
 from ._export import obsidian_vault
 from ._maintenance import inspect, scan_entities, scan_relations
 from ._serde import L_TRACE, aware, now
-from .contradiction import judge_contradictions
+from .contradiction import Pending, apply_verdicts, ask_judge, mark_pending, pending_judgments
 from .errors import CLOSED_MESSAGE, EMBEDDER_HINT, StoreError, TransientError, ValidationError, needs_llm
 from .extraction.extractor import LLMExtractor
 from .extraction.prompts import check_prompts
 from .ids import _require_namespace, decision_id, entity_id, type_name
 from .insert import Insert
-from .llm.base import resolve_llm
+from .llm.base import resolve_llm, summarize_error
 from .models import (
     AnswerabilityReport,
     CypherResult,
@@ -35,6 +35,7 @@ from .models import (
     JsonValue,
     LLMConfig,
     Readiness,
+    Relation,
     RetrievalResult,
     SourceDiff,
     as_input,
@@ -44,6 +45,7 @@ from .protocols import Embedder, Extractor, GraphStore, LLMClient
 from .provenance import record_source
 from .resolution import (
     EntityResolver,
+    LLMResolver,
     ResolverMode,
     as_resolver,
     merge_warnings,
@@ -582,27 +584,81 @@ class SelfGraph:
             mode = "strict"
         found: list[InsertWarning] = []
 
+        pending: list[Pending] = []
+
         async def create(tx: Any) -> Any:
             found.clear()
+            pending.clear()
             check = self._schema_check
-            judgment = None
-            if judged and self._llm is not None:
-                planned = await _ops.create_relation(
-                    tx, self.namespace, **fields, schema_check=check, contradiction=mode, caps=caps, dry_run=True
-                )
-                judgment = await judge_contradictions(
-                    tx, self.namespace, self._llm, [planned], caps, planned.created_at
-                )
             rel = await _ops.create_relation(
                 tx, self.namespace, **fields, schema_check=check, contradiction=mode, caps=caps, warnings=found
             )
-            if judgment is not None:
-                found.extend(await judgment(rel.created_at))
+            if judged and self._llm is not None:
+                pending.extend(await mark_pending(tx, self.namespace, [rel], caps, rel.created_at))
             return rel
 
         rel = await self._in_tx(create)
+        if judged and self._llm is not None:
+            notes, _ = await self._judge([rel], pending, caps)
+            found.extend(notes)
         log_schema_warnings(found)
         return rel
+
+    async def _judge(
+        self,
+        written: list[Relation],
+        pending: list[Pending],
+        caps: dict[str, Any],
+        names: Mapping[str, str] | None = None,
+    ) -> tuple[list[InsertWarning], list[str]]:
+        """Judge a committed write's pending relations and any left pending from the same entities, oldest first.
+
+        @param written (list[Relation]): the relations the write stored.
+        @param pending (list[Pending]): the pending judgments the write marked.
+        @param caps (dict[str, Any]): the schema's max_count limits by relation type.
+        @param names (Mapping[str, str] | None): names of entities as the write stated them.
+        @return (tuple[list[InsertWarning], list[str]]): the warnings, and the relations deferred source
+            replacements retired.
+        """
+        reader = await self._reader()
+        mine = {p.relation.id for p in pending}
+        left = await pending_judgments(reader, self.namespace, {r.from_entity for r in written}, mine)
+        warnings: list[InsertWarning] = []
+        retired: list[str] = []
+        for group, stated in [*((g, None) for g in left), (pending, names)]:
+            if not group:
+                continue
+            notes, gone = await self._settle(reader, group, caps, stated)
+            warnings.extend(notes)
+            retired.extend(gone)
+        return warnings, retired
+
+    async def _settle(
+        self, reader: Any, group: list[Pending], caps: dict[str, Any], names: Mapping[str, str] | None
+    ) -> tuple[list[InsertWarning], list[str]]:
+        """Ask the judge about one write's pending relations, then apply its verdicts in a short write.
+
+        @param reader (Any): graph reader.
+        @param group (list[Pending]): the pending judgments from one write.
+        @param caps (dict[str, Any]): the schema's max_count limits by relation type.
+        @param names (Mapping[str, str] | None): names of entities as the write stated them.
+        @return (tuple[list[InsertWarning], list[str]]): the warnings, and the relations deferred source
+            replacements retired.
+        """
+        ids = ", ".join(sorted(p.relation.id for p in group))
+        failed: list[InsertWarning] = []
+        chosen = None
+        try:
+            chosen = await ask_judge(reader, self.namespace, self._llm, group, caps, names)  # type: ignore[arg-type]
+        except Exception as exc:  # noqa: BLE001
+            message = f"the LLM contradiction judge failed, so {ids} stay pending: {summarize_error(exc)}"
+            failed.append(InsertWarning(code="contradiction_not_judged", message=message))
+        try:
+            notes, retired = await self._in_tx(lambda tx: apply_verdicts(tx, self.namespace, group, chosen, now()))
+        except (TransientError, StoreError) as exc:
+            message = f"the LLM contradiction verdicts on {ids} were not applied, so they stay pending: {exc}"
+            return [*failed, InsertWarning(code="contradiction_not_judged", message=message)], []
+        return [*failed, *notes], retired
 
     def _build_extractor(
         self,
@@ -663,17 +719,31 @@ class SelfGraph:
         if extraction is not None:
             used = {"extraction": extraction, **used}
 
+        def dated(canonical: Extraction) -> Extraction:
+            stamped = [
+                r if r.event_time is not None else r.model_copy(update={"event_time": default_event_time})
+                for r in canonical.relations
+            ]
+            return canonical.model_copy(update={"relations": stamped})
+
+        replay = None
+        if isinstance(active_resolver, LLMResolver):
+            _ops._require_datetime("event_time", default_event_time)
+            reader = await self._reader()
+            ahead = await _ops.validate_facts(reader, ns, facts, rewrite=lambda o: canonicalize_types(o, active_schema))
+            replay = await active_resolver.ask_ahead(reader, ns, dated(ahead), active_schema, created_at)
+
+        pending: list[Pending] = []
+        names: dict[str, str] = {}
+
         async def _apply(tx: Any) -> InsertResult:
+            pending.clear()
             _ops._require_datetime("event_time", default_event_time)
             canonical = await _ops.validate_facts(tx, ns, facts, rewrite=lambda o: canonicalize_types(o, active_schema))
             resolution = None
             if active_resolver is not None:
-                dated = [
-                    r if r.event_time is not None else r.model_copy(update={"event_time": default_event_time})
-                    for r in canonical.relations
-                ]
-                stamped = canonical.model_copy(update={"relations": dated})
-                resolution = await plan_resolution(tx, ns, stamped, active_resolver, active_schema, created_at)
+                plan = partial(plan_resolution, tx, ns, dated(canonical), active_resolver, active_schema, created_at)
+                resolution = await (plan() if replay is None else replay(plan))
             resolved = resolution.facts if resolution is not None else canonical
             dropped: list[InsertWarning] = []
             if extracted and mode == "strict":
@@ -687,27 +757,8 @@ class SelfGraph:
                 await _ops.require_max_count(tx, ns, caps, resolved.relations, default_event_time, created_at)
             await _ops.require_relation_identities(tx, ns, resolved.relations)
             await _ops.require_preference_identities(tx, ns, resolved.preferences)
-            judgment = None
-            if judged and self._llm is not None:
-                planned = await _ops.upsert_relations(
-                    tx,
-                    ns,
-                    [(rel, []) for rel in resolved.relations],
-                    default_event_time=default_event_time,
-                    created_at=created_at,
-                    contradiction=conflicts,
-                    caps=caps,
-                    dry_run=True,
-                )
-                judgment = await judge_contradictions(
-                    tx,
-                    ns,
-                    self._llm,
-                    planned,
-                    caps,
-                    created_at,
-                    {ent.id or entity_id(ent.type, ent.name): ent.name for ent in resolved.entities},
-                )
+            names.clear()
+            names.update({ent.id or entity_id(ent.type, ent.name): ent.name for ent in resolved.entities})
             source_version: str | None = None
             base_evidence = []
             prior = await _ops.source_targets(tx, ns, source_id) if replace_source and source_id else set()
@@ -764,18 +815,24 @@ class SelfGraph:
                 warnings=found,
                 via=None if resolution is None else [[resolution.statements(rel)] * len(ev) for rel, ev in items],
             )
-            if judgment is not None:
-                found.extend(await judgment(created_at))
 
             diff = None
-            if replace_source and source_id is not None and source_version is not None:
+            replacing = replace_source and source_id is not None and source_version is not None
+            incomplete = any(w.code == "extraction_partial_failure" and w.chunk_id is not None for w in warnings)
+            stale = prior - {r.id for r in relations} if replacing and not incomplete else set()
+            if judged and self._llm is not None:
+                marked = await mark_pending(
+                    tx, ns, relations, caps, created_at, source_id=source_id, source_version=source_version, stale=stale
+                )
+                pending.extend(marked)
+                stale -= {rid for item in marked for rid in item.deferred}
+            if replacing:
                 produced = {r.id for r in relations}
                 at = aware(default_event_time or created_at)
-                incomplete = any(w.code == "extraction_partial_failure" and w.chunk_id is not None for w in warnings)
                 retired, notes = (
                     ([], [])
                     if incomplete
-                    else await _ops.replace_source(tx, ns, source_id, source_version, prior - produced, at, created_at)
+                    else await _ops.replace_source(tx, ns, source_id, source_version, stale, at, created_at)
                 )
                 found.extend(notes)
                 diff = SourceDiff(kept=sorted(produced & prior), added=sorted(produced - prior), retired=retired)
@@ -850,4 +907,13 @@ class SelfGraph:
                 source_diff=diff,
             )
 
-        return await self._in_tx(_apply)
+        result = await self._in_tx(_apply)
+        if judged and self._llm is not None:
+            notes, retired = await self._judge(result.relations, pending, caps, names)
+            log_schema_warnings([w for w in notes if w.code == "contradiction_not_judged"])
+            if retired and result.source_diff is not None:
+                result.source_diff.retired = sorted({*result.source_diff.retired, *retired})
+            result.warnings += [
+                w if w.source_id is not None else w.model_copy(update={"source_id": source_id}) for w in notes
+            ]
+        return result

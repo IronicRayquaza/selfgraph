@@ -1,7 +1,7 @@
 import { expect, it } from "vitest";
-import { HINTS } from "../src/errors.js";
-import { ExtractionError, type LLMClient } from "../src/index.js";
-import { freshGraphs, KUZU_SPEC } from "./helpers.js";
+import { PENDING } from "../src/contradiction.js";
+import { ids, type LLMClient } from "../src/index.js";
+import { captureLog, freshGraphs, KUZU_SPEC } from "./helpers.js";
 
 const graph = freshGraphs(KUZU_SPEC, "llm_regression");
 const entities = ["A", "B", "C"].map((name) => ({ type: "T", name }));
@@ -45,11 +45,10 @@ it.each(["", "   "])("339 drops empty extracted property %j", async (key) => {
 
 for (const operation of ["facts", "text", "create"]) {
   it.each([{ retired: "bad" }, { retired: [null] }])(
-    `336 ${operation} rejects verdict %j before writes`,
+    `336 ${operation} keeps the committed write and its judgment pending on verdict %j`,
     async (reply) => {
       const g = graph({ llm: client(reply), extraction: "llm", contradiction: "llm" });
       await g.insert.facts({ entities, relations: [{ ...relation, to_entity: "t:b" }] });
-      const before = (await g.relations.list()).items;
       const write =
         operation === "text"
           ? () => g.insert.text("A knows C.", { source_id: "new-source" })
@@ -60,17 +59,18 @@ for (const operation of ["facts", "text", "create"]) {
                   { entities: [{ type: "T", name: "D" }], relations: [relation] },
                   { source_id: "new-source" },
                 );
-      const error = await write().catch((error: unknown) => error);
-      expect((await g.relations.list()).items).toEqual(before);
-      expect(await g.entities.get("t:d")).toBeNull();
-      expect(await g.store.getNode(g.namespace, "Source", "new-source")).toBeNull();
-      expect(error).toMatchObject({
-        name: new ExtractionError("").name,
-        code: "invalid_llm_output",
-        field: "retired",
-        hint: HINTS.invalid_llm_output,
-        message: "LLM client returned an invalid contradiction verdict",
-      });
+      const { logged } = await captureLog(async () => void (await write()));
+      const rid = ids.relationId("t:a", "KNOWS", "t:c");
+      expect((await g.relations.list()).items.map((r) => r.id).sort()).toEqual(
+        [ids.relationId("t:a", "KNOWS", "t:b"), rid].sort(),
+      );
+      expect((await g.store.getCurrentEdge(g.namespace, rid))!.props[PENDING]).toBeTruthy();
+      const message =
+        `the LLM contradiction judge failed, so ${rid} stay pending: ` +
+        "ExtractionError: LLM client returned an invalid contradiction verdict";
+      expect(logged.filter((m) => m.includes("contradiction_not_judged"))).toEqual([
+        `warning: schema warning [contradiction_not_judged]: ${message}`,
+      ]);
     },
   );
 }

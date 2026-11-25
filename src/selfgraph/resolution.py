@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import lru_cache, partial
@@ -418,8 +419,13 @@ class LLMResolver:
             if _ops.entity_type_key(ent.type) == ckey and not distinct_names(candidate.name, ent.name, low)
         ]
         band = sorted(((s, e) for s, e in scored if low <= s < high), key=lambda pair: (-pair[0], pair[1].id))
+        book = (_RECORDED.get() or {}).get(id(self))
         for similarity, ent in band[: self.max_questions]:
-            answer = await self._llm.generate(system=_LLM_SYSTEM, user=_question(candidate, ent), output=_SameEntity)
+            question = _question(candidate, ent)
+            if book is None:
+                answer = await self._llm.generate(system=_LLM_SYSTEM, user=question, output=_SameEntity)
+            else:
+                answer = await book.answer(self._llm, question, ent)
             same = answer.get("same") if isinstance(answer, Mapping) else getattr(answer, "same", None)
             if type(same) is not bool:
                 raise ExtractionError(
@@ -430,6 +436,62 @@ class LLMResolver:
             if same:
                 return ResolutionDecision(target_id=ent.id, confidence=similarity, reason="llm")
         return _no_match()
+
+    async def ask_ahead(
+        self, runner: Any, ns: str, facts: Extraction, schema: Schema | None, created_at: datetime
+    ) -> Callable[[Callable[[], Awaitable[Any]]], Awaitable[Any]]:
+        """Ask the LLM what resolving some facts needs before the write, returning a runner that replays only that.
+
+        @param runner (Any): a graph reader, outside any write.
+        @param ns (str): namespace.
+        @param facts (Extraction): the validated facts the write will resolve.
+        @param schema (Schema | None): the active schema.
+        @param created_at (datetime): the insert time.
+        @return (Callable[[Callable[[], Awaitable[Any]]], Awaitable[Any]]): runs a call with this resolver answering
+            from the recorded answers, and "not the same entity" for an entity that changed since it was asked about.
+        """
+        book = _Book()
+        await _answering(self, book, lambda: plan_resolution(runner, ns, facts, self, schema, created_at))
+        book.recording = False
+        return lambda call: _answering(self, book, call)
+
+
+class _Book:
+    def __init__(self) -> None:
+        self.recording = True
+        self.answers: dict[tuple[str, str, datetime, datetime], Any] = {}
+
+    async def answer(self, llm: LLMClient, question: str, ent: Entity) -> Any:
+        """Ask the LLM and keep its answer, or replay the one kept for this question about this state of the entity.
+
+        @param llm (LLMClient): the resolver's LLM.
+        @param question (str): the question.
+        @param ent (Entity): the entity asked about, as read.
+        @return (Any): the answer, or "not the same" when none was kept for this state of the entity.
+        """
+        key = (question, ent.id, ent.created_at, ent.updated_at)
+        if self.recording:
+            self.answers[key] = await llm.generate(system=_LLM_SYSTEM, user=question, output=_SameEntity)
+            return self.answers[key]
+        return self.answers.get(key) or _SameEntity(same=False)
+
+
+_RECORDED: ContextVar[dict[int, _Book] | None] = ContextVar("selfgraph_recorded_answers", default=None)
+
+
+async def _answering(resolver: LLMResolver, book: _Book, call: Callable[[], Awaitable[Any]]) -> Any:
+    """Run a call with one LLM resolver answering through a book of answers, for the call's context only.
+
+    @param resolver (LLMResolver): the resolver.
+    @param book (_Book): the answers it records or replays.
+    @param call (Callable[[], Awaitable[Any]]): the call.
+    @return (Any): the call's result.
+    """
+    token = _RECORDED.set({**(_RECORDED.get() or {}), id(resolver): book})
+    try:
+        return await call()
+    finally:
+        _RECORDED.reset(token)
 
 
 def _question(candidate: EntityInput, ent: Entity) -> str:

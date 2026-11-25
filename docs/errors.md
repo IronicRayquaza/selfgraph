@@ -480,6 +480,13 @@ the user to certify it again if it should be.
 A replaced source no longer states a relation, so the relation was retired.
 Nothing to fix if the source changed on purpose.
 
+#### `contradiction_not_judged`
+
+With `contradiction="llm"`, the judge failed or its verdicts could not be
+written after the write committed, so the relations the message names stay
+pending. The next judged write from the same entity judges them again; fix the
+LLM or store and nothing else is needed.
+
 #### `extraction_partial_failure`
 
 Some extraction calls or items failed, and the rest was inserted. The message

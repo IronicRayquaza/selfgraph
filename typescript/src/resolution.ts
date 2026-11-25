@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
 
 import { ExtractionError, NotFoundError, needsLlm, ValidationError } from "./errors.js";
@@ -6,7 +7,7 @@ import * as ids from "./ids.js";
 import { dumps, loads } from "./internal/json.js";
 import { contextPayload } from "./internal/payload.js";
 import { comparePy, cpLen, deepEqual, pyFloatRepr, pyRepr, pyStrip } from "./internal/py.js";
-import { fromIso, jsonIso, toIso } from "./internal/time.js";
+import { epochMicros, fromIso, jsonIso, toIso } from "./internal/time.js";
 import { DECIMAL_CLASS } from "./internal/unicode.js";
 import { L_ENTITY, L_EVIDENCE, L_MERGE, L_MERGE_ENTRY, L_SOURCE_VERSION, L_TRACE } from "./labels.js";
 import { type LLMArg, resolveLlm } from "./llm/index.js";
@@ -453,12 +454,13 @@ export class LLMResolver implements EntityResolver {
       .map((ent) => [nameSimilarity(candidate.name, ent.name), ent] as const)
       .filter(([s]) => low <= s && s < high)
       .sort((p, q) => q[0] - p[0] || comparePy(p[1].id, q[1].id));
+    const book = RECORDED.getStore()?.get(this);
     for (const [similarity, ent] of band.slice(0, this.max_questions)) {
-      const answer = await this.llm.generate({
-        system: LLM_SYSTEM,
-        user: question(candidate, ent),
-        output: SameEntity,
-      });
+      const user = question(candidate, ent);
+      const answer =
+        book === undefined
+          ? await this.llm.generate({ system: LLM_SYSTEM, user, output: SameEntity })
+          : await book.answer(this.llm, user, ent);
       const parsed = SameEntity.safeParse(answer);
       if (!parsed.success) {
         throw new ExtractionError("LLM client returned an invalid result for the resolver: same must be a boolean", {
@@ -470,6 +472,64 @@ export class LLMResolver implements EntityResolver {
     }
     return noMatch();
   }
+
+  /**
+   * Ask the LLM what resolving some facts needs before the write, returning a runner that replays only that.
+   *
+   * @param runner (GraphPrimitives): a graph reader, outside any write.
+   * @param ns (string): the namespace.
+   * @param facts (ParsedExtraction): the validated facts the write will resolve.
+   * @param schema (ParsedSchema | null): the active schema.
+   * @param createdAt (Date): the insert time.
+   * @return (Function): runs a call with this resolver answering from the recorded answers, and "not the same entity" for an entity that changed since it was asked about.
+   */
+  async askAhead(
+    runner: GraphPrimitives,
+    ns: string,
+    facts: ParsedExtraction,
+    schema: ParsedSchema | null,
+    createdAt: Date,
+  ): Promise<<T>(call: () => Promise<T>) => Promise<T>> {
+    const book = new Book();
+    await answering(this, book, () => planResolution(runner, ns, facts, this, schema, createdAt));
+    book.recording = false;
+    return (call) => answering(this, book, call);
+  }
+}
+
+class Book {
+  recording = true;
+  private readonly answers = new Map<string, unknown>();
+
+  /**
+   * Ask the LLM and keep its answer, or replay the one kept for this question about this state of the entity.
+   *
+   * @param llm (LLMClient): the resolver's LLM.
+   * @param user (string): the question.
+   * @param ent (Entity): the entity asked about, as read.
+   * @return (unknown): the answer, or "not the same" when none was kept for this state of the entity.
+   */
+  async answer(llm: LLMClient, user: string, ent: Entity): Promise<unknown> {
+    const key = JSON.stringify([user, ent.id, epochMicros(ent.created_at), epochMicros(ent.updated_at)]);
+    if (!this.recording) return this.answers.get(key) ?? { same: false };
+    const answer = await llm.generate({ system: LLM_SYSTEM, user, output: SameEntity });
+    this.answers.set(key, answer);
+    return answer;
+  }
+}
+
+const RECORDED = new AsyncLocalStorage<ReadonlyMap<LLMResolver, Book>>();
+
+/**
+ * Run a call with one LLM resolver answering through a book of answers, for the call's context only.
+ *
+ * @param resolver (LLMResolver): the resolver.
+ * @param book (Book): the answers it records or replays.
+ * @param call (() => Promise<T>): the call.
+ * @return (T): the call's result.
+ */
+function answering<T>(resolver: LLMResolver, book: Book, call: () => Promise<T>): Promise<T> {
+  return RECORDED.run(new Map([...(RECORDED.getStore() ?? []), [resolver, book]]), call);
 }
 
 /**

@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { ids, KuzuStore, SelfGraph } from "../src/index.js";
+import { comparePy } from "../src/internal/py.js";
 import type { Schema } from "../src/schema.js";
 import {
   conformanceStore,
@@ -378,6 +379,31 @@ describe.skipIf(!PY)("cross-language conformance with the Python SDK", () => {
         const tsOps = await ts(store, nsTs, write);
         expect(tsOps.dedupe_conflicts).toEqual({ "relation:touch-b": ["active", "flags"] });
         expect(tsOps.facts_none).toBe("invalid facts: expected object");
+        const acme = ids.relationId("person:ann", "WORKS_AT", "company:acme");
+        const globex = ids.relationId("person:ann", "WORKS_AT", "company:globex");
+        for (const ops of [pyOps, tsOps]) {
+          expect((ops as { judge_window: unknown }).judge_window).toEqual({
+            pending: {
+              codes: ["contradiction_not_judged"],
+              state: [
+                [acme, true, null, null, false],
+                [globex, true, null, null, true],
+              ],
+            },
+            judged: {
+              codes: ["relation_superseded"],
+              state: [
+                [acme, false, globex, "2022-01-01T00:00:00Z", false],
+                [globex, true, null, null, false],
+              ],
+              calls: 1,
+              known_after_the_write: true,
+              window: [acme, globex].sort(comparePy),
+              now: [globex],
+            },
+            rerun_calls: 1,
+          });
+        }
         for (const ops of [pyOps, tsOps]) {
           const names = (ops as { unicode_text: { entities: { name: string }[] } }).unicode_text.entities.map(
             (entity) => entity.name,

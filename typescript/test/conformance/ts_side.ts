@@ -1847,6 +1847,76 @@ async function preferenceDeleteCounts(graph: SelfGraph): Promise<Record<string, 
  * @param graph (SelfGraph): the graph whose store hosts the isolated case.
  * @return (Promise<unknown[]>): the relation and preference versions after each of three runs.
  */
+/**
+ * Judge a write after it commits: both facts stay current until a verdict lands, and a pending one is judged again.
+ *
+ * @param graph (SelfGraph): the graph whose store hosts the isolated case.
+ * @return (Record<string, unknown>): the warning codes and relation states while the judgment is pending and after it is judged.
+ */
+async function judgeWindow(graph: SelfGraph): Promise<Record<string, unknown>> {
+  class Judge {
+    calls = 0;
+    constructor(private readonly fail: boolean) {}
+
+    async generate<T>(args: { system: string; user: string; output: { parse(value: unknown): T } }): Promise<T> {
+      this.calls += 1;
+      if (this.fail) throw new Error("judge down");
+      return args.output.parse({ retired: [1] });
+    }
+  }
+  const ns = `${graph.namespace}_judge_window`;
+  const working = new Judge(false);
+  const down = new SelfGraph(graph.store, { namespace: ns, llm: new Judge(true), contradiction: "llm" });
+  const up = new SelfGraph(graph.store, { namespace: ns, llm: working, contradiction: "llm" });
+  const acme = ids.relationId("person:ann", "WORKS_AT", "company:acme");
+  const globex = ids.relationId("person:ann", "WORKS_AT", "company:globex");
+  const people = [
+    { type: "Person", name: "Ann" },
+    { type: "Company", name: "Acme" },
+    { type: "Company", name: "Globex" },
+  ];
+  const fact = (company: string, year: number) => ({
+    from_entity: "person:ann",
+    type: "WORKS_AT",
+    to_entity: `company:${company}`,
+    event_time: `${year}-01-01T00:00:00Z`,
+  });
+  const snapshot = async (): Promise<unknown[]> => {
+    const rows: unknown[] = [];
+    for (const rid of [acme, globex]) {
+      const version = (await up.relations.versions(rid)).at(-1)!;
+      const edge = await up.store.getCurrentEdge(ns, rid);
+      rows.push([
+        rid,
+        version.is_current,
+        version.invalidated_by,
+        version.invalidated_at ? jsonIso(version.invalidated_at) : null,
+        edge !== null && Boolean(edge.props.judge_pending_json),
+      ]);
+    }
+    return rows;
+  };
+  await down.insert.facts({ entities: people, relations: [fact("acme", 2020)] });
+  const pending = await down.insert.facts({ relations: [fact("globex", 2022)] });
+  const out: Record<string, unknown> = {
+    pending: { codes: pending.warnings.map((w) => w.code), state: await snapshot() },
+  };
+  const judged = await up.insert.facts({ relations: [fact("globex", 2022)] });
+  const retired = (await up.relations.versions(acme)).at(-1)!;
+  const window = (await up.retrieve("Ann", { known_at: pending.created_at })).subgraph.relations;
+  out.judged = {
+    codes: judged.warnings.map((w) => w.code),
+    state: await snapshot(),
+    calls: working.calls,
+    known_after_the_write: retired.invalidated_known_at!.getTime() > pending.created_at.getTime(),
+    window: window.map((r) => r.id).sort(comparePy),
+    now: (await up.retrieve("Ann")).subgraph.relations.map((r) => r.id).sort(comparePy),
+  };
+  await up.insert.facts({ relations: [fact("globex", 2022)] });
+  out.rerun_calls = working.calls;
+  return out;
+}
+
 async function repeatedIdReplays(graph: SelfGraph): Promise<unknown[]> {
   const g = new SelfGraph(graph.store, { namespace: `${graph.namespace}_repeated_ids` });
   await g.insert.facts({
@@ -2751,6 +2821,7 @@ export async function write(graph: SelfGraph): Promise<Record<string, unknown>> 
   };
   out.preference_delete_counts = await preferenceDeleteCounts(graph);
   out.repeated_id_replays = await repeatedIdReplays(graph);
+  out.judge_window = await judgeWindow(graph);
   return out;
 }
 

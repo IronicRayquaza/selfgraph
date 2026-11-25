@@ -1,5 +1,5 @@
 import type { GraphAccess } from "./access.js";
-import { judgeContradictions } from "./contradiction.js";
+import { judgeWritten, markPending, type Pending } from "./contradiction.js";
 import { ExtractionError, errorMessage, SelfGraphError, ValidationError } from "./errors.js";
 import { NERExtractor } from "./extraction/basic.js";
 import { LLMExtractor } from "./extraction/extractor.js";
@@ -31,6 +31,7 @@ import type { Extractor, LLMClient } from "./protocols.js";
 import { recordSource } from "./provenance.js";
 import {
   type EntityResolver,
+  LLMResolver,
   mergeWarnings,
   planResolution,
   type ResolverMode,
@@ -50,6 +51,7 @@ import {
   requireSchemaMode,
   type Schema,
   type SchemaMode,
+  warnSchema,
 } from "./schema.js";
 import {
   checkOptions,
@@ -228,14 +230,30 @@ export class Insert {
       resolution: resolverTier,
       contradiction: judged ? "llm" : conflicts,
     };
-    return this.graph.write(async (tx, ns) => {
+    const dated = (canonical: ParsedExtraction): ParsedExtraction => ({
+      ...canonical,
+      relations: canonical.relations.map((r) => ({ ...r, event_time: r.event_time ?? source.default_event_time })),
+    });
+    const replay =
+      activeResolver instanceof LLMResolver
+        ? await this.graph.read(async (store, ns) =>
+            activeResolver.askAhead(
+              store,
+              ns,
+              dated(await ops.validateFacts(store, ns, facts, (o) => canonicalizeTypes(o, activeSchema))),
+              activeSchema,
+              createdAt,
+            ),
+          )
+        : null;
+    const pending: Pending[] = [];
+    const names = new Map<string, string>();
+    const result = await this.graph.write(async (tx, ns) => {
+      pending.length = 0;
       const canonical = await ops.validateFacts(tx, ns, facts, (o) => canonicalizeTypes(o, activeSchema));
-      const stamped = {
-        ...canonical,
-        relations: canonical.relations.map((r) => ({ ...r, event_time: r.event_time ?? source.default_event_time })),
-      };
-      let resolution =
-        activeResolver === null ? null : await planResolution(tx, ns, stamped, activeResolver, activeSchema, createdAt);
+      const stamped = dated(canonical);
+      const plan = () => planResolution(tx, ns, stamped, activeResolver!, activeSchema, createdAt);
+      let resolution = activeResolver === null ? null : await (replay === null ? plan() : replay(plan));
       let resolved = resolution?.facts ?? canonical;
       let dropped: InsertWarning[] = [];
       if (extracted && mode === "strict") {
@@ -249,26 +267,8 @@ export class Insert {
         await ops.requireMaxCount(tx, ns, caps, resolved.relations, source.default_event_time, createdAt);
       await ops.requireRelationIdentities(tx, ns, resolved.relations);
       await ops.requirePreferenceIdentities(tx, ns, resolved.preferences);
-      let judgment: ((at: Date) => Promise<InsertWarning[]>) | null = null;
-      if (judged && llm !== null) {
-        const planned = await ops.upsertRelations(
-          tx,
-          ns,
-          resolved.relations.map((rel) => [rel, []] as const),
-          source.default_event_time,
-          createdAt,
-          { contradiction: conflicts, caps, dry_run: true },
-        );
-        judgment = await judgeContradictions(
-          tx,
-          ns,
-          llm,
-          planned,
-          caps,
-          createdAt,
-          new Map(resolved.entities.map((ent) => [ent.id || ids.entityId(ent.type, ent.name), ent.name])),
-        );
-      }
+      names.clear();
+      for (const ent of resolved.entities) names.set(ent.id || ids.entityId(ent.type, ent.name), ent.name);
       let sourceVersion: string | null = null;
       let baseEvidence: Evidence[] = [];
       const prior =
@@ -311,24 +311,26 @@ export class Insert {
         warnings: found,
         ...(via ? { via } : {}),
       });
-      if (judgment !== null) found.push(...(await judgment(createdAt)));
 
       let diff: SourceDiff | null = null;
-      if (source.replace_source && source.source_id !== null && sourceVersion !== null) {
-        const produced = new Set(relations.map((r) => r.id));
+      const replacing = source.replace_source && source.source_id !== null && sourceVersion !== null;
+      const incomplete = source.warnings.some((w) => w.code === "extraction_partial_failure" && w.chunk_id !== null);
+      const produced = new Set(relations.map((r) => r.id));
+      const stale = new Set(replacing && !incomplete ? [...prior].filter((id) => !produced.has(id)) : []);
+      if (judged && llm !== null) {
+        const marked = await markPending(tx, ns, relations, caps, createdAt, {
+          sourceId: source.source_id,
+          sourceVersion,
+          stale,
+        });
+        pending.push(...marked);
+        for (const item of marked) for (const rid of item.deferred) stale.delete(rid);
+      }
+      if (replacing && source.source_id !== null && sourceVersion !== null) {
         const at = source.default_event_time ?? createdAt;
-        const incomplete = source.warnings.some((w) => w.code === "extraction_partial_failure" && w.chunk_id !== null);
         const [retired, notes] = incomplete
           ? [[], []]
-          : await ops.replaceSource(
-              tx,
-              ns,
-              source.source_id,
-              sourceVersion,
-              [...prior].filter((id) => !produced.has(id)),
-              at,
-              createdAt,
-            );
+          : await ops.replaceSource(tx, ns, source.source_id, sourceVersion, stale, at, createdAt);
         found.push(...notes);
         const sorted = (keep: (id: string) => boolean) => [...produced].filter(keep).sort(comparePy);
         diff = { kept: sorted((id) => prior.has(id)), added: sorted((id) => !prior.has(id)), retired };
@@ -389,6 +391,15 @@ export class Insert {
         source_diff: diff,
       };
     });
+    if (judged && llm !== null) {
+      const [notes, retired] = await judgeWritten(this.graph, llm, result.relations, pending, caps, names);
+      warnSchema(notes.filter((w) => w.code === "contradiction_not_judged"));
+      if (retired.length && result.source_diff) {
+        result.source_diff.retired = [...new Set([...result.source_diff.retired, ...retired])].sort(comparePy);
+      }
+      result.warnings.push(...notes.map((w) => (w.source_id == null ? { ...w, source_id: source.source_id } : w)));
+    }
+    return result;
   }
 
   private async extract(extractor: Extractor, document: ParsedDocument): Promise<ParsedExtraction> {

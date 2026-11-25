@@ -131,6 +131,12 @@ are never asked either. `Bill Gates` and `William Gates` score 0.81, inside the
 band, but `Bill` has no counterpart in `William`, so they stay apart. Link such
 names with an alias or a shared external id.
 
+An insert asks these questions before its write transaction, so no lock is
+held while the LLM answers, and a retried write does not ask again. Inside the
+write each answer is used only for the entity as it was when asked. If that
+entity was changed, or deleted and created again, in between, the answer is
+"not the same" and the lexical decision stands.
+
 ## Custom resolvers
 
 Any object with an async `resolve(candidate, existing)` method works as

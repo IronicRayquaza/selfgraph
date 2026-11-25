@@ -1593,6 +1593,79 @@ async def symbol_entity_ids(graph):
     }
 
 
+async def judge_window(graph):
+    """Judge a write after it commits: both facts stay current until a verdict lands, and a pending one is judged again.
+
+    @param graph (SelfGraph): the graph whose store hosts the isolated case.
+    @return (dict): the warning codes and relation states while the judgment is pending and after it is judged.
+    """
+
+    class Judge:
+        def __init__(self, fail):
+            self.fail = fail
+            self.calls = 0
+
+        async def generate(self, *, system, user, output):
+            self.calls += 1
+            if self.fail:
+                raise RuntimeError("judge down")
+            return output(retired=[1])
+
+    ns = f"{graph.namespace}_judge_window"
+    working = Judge(False)
+    down = SelfGraph(store=graph.store, namespace=ns, llm=Judge(True), contradiction="llm")
+    up = SelfGraph(store=graph.store, namespace=ns, llm=working, contradiction="llm")
+    acme = ids.relation_id("person:ann", "WORKS_AT", "company:acme")
+    globex = ids.relation_id("person:ann", "WORKS_AT", "company:globex")
+    people = [
+        {"type": "Person", "name": "Ann"},
+        {"type": "Company", "name": "Acme"},
+        {"type": "Company", "name": "Globex"},
+    ]
+
+    def fact(company, year):
+        return {
+            "from_entity": "person:ann",
+            "type": "WORKS_AT",
+            "to_entity": f"company:{company}",
+            "event_time": f"{year}-01-01T00:00:00Z",
+        }
+
+    async def snapshot():
+        rows = []
+        for rid in (acme, globex):
+            version = (await up.relations.versions(rid))[-1]
+            edge = await up.store.get_current_edge(ns, rid)
+            rows.append(
+                [
+                    rid,
+                    version.is_current,
+                    version.invalidated_by,
+                    json_iso(version.invalidated_at) if version.invalidated_at else None,
+                    edge is not None and bool(edge["props"].get("judge_pending_json")),
+                ]
+            )
+        return rows
+
+    await down.insert.facts({"entities": people, "relations": [fact("acme", 2020)]})
+    pending = await down.insert.facts({"relations": [fact("globex", 2022)]})
+    out = {"pending": {"codes": [w.code for w in pending.warnings], "state": await snapshot()}}
+    judged = await up.insert.facts({"relations": [fact("globex", 2022)]})
+    retired = (await up.relations.versions(acme))[-1]
+    window = (await up.retrieve("Ann", known_at=pending.created_at)).subgraph.relations
+    out["judged"] = {
+        "codes": [w.code for w in judged.warnings],
+        "state": await snapshot(),
+        "calls": working.calls,
+        "known_after_the_write": retired.invalidated_known_at > pending.created_at,
+        "window": sorted(r.id for r in window),
+        "now": sorted(r.id for r in (await up.retrieve("Ann")).subgraph.relations),
+    }
+    await up.insert.facts({"relations": [fact("globex", 2022)]})
+    out["rerun_calls"] = working.calls
+    return out
+
+
 async def write(graph):
     from selfgraph.models import CypherResult
 
@@ -2333,6 +2406,7 @@ async def write(graph):
     }
     out["preference_delete_counts"] = await preference_delete_counts(graph)
     out["repeated_id_replays"] = await repeated_id_replays(graph)
+    out["judge_window"] = await judge_window(graph)
     return out
 
 

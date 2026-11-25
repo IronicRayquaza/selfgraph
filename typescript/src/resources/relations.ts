@@ -1,4 +1,4 @@
-import { judgeContradictions } from "../contradiction.js";
+import { judgeWritten, markPending, type Pending } from "../contradiction.js";
 import { NotFoundError } from "../errors.js";
 import { pyStrip } from "../internal/py.js";
 import type {
@@ -93,8 +93,10 @@ export class Relations extends Resource {
     const rtype = typeof type === "string" && pyStrip(type) ? canonicalRelationType(type, this.graph.schema) : type;
     const { llm } = this.graph.tiers;
     const warnings: InsertWarning[] = [];
+    const pending: Pending[] = [];
     const rel = await this.graph.write(async (tx, ns) => {
       warnings.length = 0;
+      pending.length = 0;
       const fields = {
         from_entity: fromEntity,
         type: rtype,
@@ -105,15 +107,15 @@ export class Relations extends Resource {
         evidence,
       };
       const check = { ...conflicts, ...(strict && { contradiction: "strict" }) };
-      let judgment: ((at: Date) => Promise<InsertWarning[]>) | null = null;
-      if (judged && llm !== null) {
-        const planned = await ops.createRelation(tx, ns, fields, this.graph.schemaCheck, { ...check, dry_run: true });
-        judgment = await judgeContradictions(tx, ns, llm, [planned], conflicts.caps, planned.created_at);
-      }
       const created = await ops.createRelation(tx, ns, fields, this.graph.schemaCheck, { ...check, warnings });
-      if (judgment !== null) warnings.push(...(await judgment(created.created_at)));
+      if (judged && llm !== null)
+        pending.push(...(await markPending(tx, ns, [created], conflicts.caps, created.created_at)));
       return created;
     });
+    if (judged && llm !== null) {
+      const [notes] = await judgeWritten(this.graph, llm, [rel], pending, conflicts.caps);
+      warnings.push(...notes);
+    }
     warnSchema(warnings);
     return rel;
   }

@@ -269,7 +269,8 @@ What bounds the cost:
   nothing.
 - A relation type with a `max_count` is settled by that rule and never sent.
 - Only relations this write created or changed are judged, so re-inserting the
-  same facts asks nothing.
+  same facts asks nothing, unless a judgment from an earlier write is still
+  pending.
 - At most 20 rivals are listed per call, lowest id first.
 
 Each fact is sent to the LLM as one numbered line. Line breaks and control
@@ -278,6 +279,24 @@ stored text cannot add a numbered fact to the prompt.
 
 The LLM can decide differently on a rerun. Use `max_count` where the rule is
 known, and keep `llm` for what a schema cannot state.
+
+The judge is asked after the write commits, so no lock is held while the LLM
+answers. Its retirements are written by a second, short write, and their
+`invalidated_known_at` is when that write ran. Until then the new relation and
+its rival are both current, and a `known_at` read from that window shows both.
+A verdict is skipped when the new relation or the rival changed, or was deleted
+and created again, after the judge read it.
+
+The write marks each relation it asks about as pending, and the second write
+clears the mark. If the judge fails, or the process stops before the second
+write, the mark stays and the result gets a `contradiction_not_judged` warning.
+The next judged write from the same source entity, including a rerun of the
+same insert, then judges it again.
+
+With `replace_source=True`, a stale relation the judge is asked about is not
+retired by the source until the judge answers. If the judge retires it, the new
+relation retires it with `relation_superseded`. Otherwise the source's current
+version retires it, as without the judge.
 
 ### Ranking and retirement
 

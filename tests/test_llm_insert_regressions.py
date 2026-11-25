@@ -1,8 +1,8 @@
 import pytest
 from helpers import FakeLLM, fresh_graph, run
 
-from selfgraph import ExtractionError
-from selfgraph.errors import HINTS
+from selfgraph import ids
+from selfgraph.contradiction import PENDING
 
 
 @pytest.fixture
@@ -36,7 +36,7 @@ def test_339_empty_extracted_property(graph, key):
 
 @pytest.mark.parametrize("operation", ["facts", "text", "create"])
 @pytest.mark.parametrize("reply", [{"retired": "bad"}, {"retired": [None]}])
-def test_336_invalid_verdict_before_writes(graph, operation, reply):
+def test_336_invalid_verdict_keeps_the_committed_write_and_its_judgment_pending(graph, operation, reply, caplog):
     run(
         graph.insert.facts(
             {
@@ -45,10 +45,9 @@ def test_336_invalid_verdict_before_writes(graph, operation, reply):
             }
         )
     )
-    before = run(graph.relations.list()).items
     graph._llm.responses["_Verdict"] = reply
     extraction(graph)
-    with pytest.raises(Exception) as caught:
+    with caplog.at_level("WARNING", logger="selfgraph"):
         if operation == "text":
             run(graph.insert.text("A knows C.", source_id="new-source"))
         elif operation == "create":
@@ -63,16 +62,16 @@ def test_336_invalid_verdict_before_writes(graph, operation, reply):
                     source_id="new-source",
                 )
             )
-    assert run(graph.relations.list()).items == before
-    assert run(graph.entities.get("t:d")) is None
-    assert run(graph.store.get_node(graph.namespace, "Source", "new-source")) is None
-    assert isinstance(caught.value, ExtractionError)
-    assert (caught.value.code, caught.value.field, caught.value.hint) == (
-        "invalid_llm_output",
-        "retired",
-        HINTS["invalid_llm_output"],
+    rid = ids.relation_id("t:a", "KNOWS", "t:c")
+    assert {r.id for r in run(graph.relations.list()).items} == {ids.relation_id("t:a", "KNOWS", "t:b"), rid}
+    edge = run(graph.store.get_current_edge(graph.namespace, rid))
+    assert edge["props"].get(PENDING)
+    message = (
+        f"the LLM contradiction judge failed, so {rid} stay pending: "
+        "ExtractionError: LLM client returned an invalid contradiction verdict"
     )
-    assert str(caught.value) == "LLM client returned an invalid contradiction verdict"
+    logged = [r.getMessage() for r in caplog.records if "contradiction_not_judged" in r.getMessage()]
+    assert logged == [f"schema warning [contradiction_not_judged]: {message}"]
 
 
 BLANK_NAME = "dropped an extracted entity: entity name cannot be empty"
