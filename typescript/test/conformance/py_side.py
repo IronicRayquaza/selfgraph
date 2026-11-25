@@ -1666,6 +1666,58 @@ async def judge_window(graph):
     return out
 
 
+async def judge_order(graph):
+    """Hold a later judgment behind an older pending one, then settle both oldest first.
+
+    @param graph (SelfGraph): the graph whose store hosts the isolated case.
+    @return (dict): the warning codes, the facts each judge call asked about, and each relation's final state.
+    """
+
+    class Judge:
+        def __init__(self, fails):
+            self.fails = fails
+            self.asked = []
+
+        async def generate(self, *, system, user, output):
+            self.asked.append(user.split("\n", 1)[0])
+            if self.fails is not None and self.fails in user.split("\n", 1)[0]:
+                raise RuntimeError("judge down")
+            older = user.split("Older facts:\n", 1)[1].split("\nWhich", 1)[0]
+            return output(retired=list(range(1, older.count("\n") + 2)))
+
+    ns = f"{graph.namespace}_judge_order"
+    names = ("acme", "globex", "initech")
+    rids = [ids.relation_id("person:ann", "WORKS_AT", f"company:{name}") for name in names]
+    people = [{"type": "Person", "name": "Ann"}, *({"type": "Company", "name": n.capitalize()} for n in names)]
+
+    def fact(company, year):
+        return {
+            "from_entity": "person:ann",
+            "type": "WORKS_AT",
+            "to_entity": f"company:{company}",
+            "event_time": f"{year}-01-01T00:00:00Z",
+        }
+
+    def graph_with(judge):
+        return SelfGraph(store=graph.store, namespace=ns, llm=judge, contradiction="llm")
+
+    down, held, up = Judge("Globex"), Judge("Globex"), Judge(None)
+    await graph_with(down).insert.facts({"entities": people, "relations": [fact("acme", 2020)]})
+    first = await graph_with(down).insert.facts({"relations": [fact("globex", 2022)]})
+    second = await graph_with(held).insert.facts({"relations": [fact("initech", 2024)]})
+    last = await graph_with(up).insert.facts({"relations": [fact("initech", 2024)]})
+    state = []
+    for rid in rids:
+        version = (await graph_with(up).relations.versions(rid))[-1]
+        at = json_iso(version.invalidated_at) if version.invalidated_at else None
+        state.append([rid, version.is_current, version.invalidated_by, at])
+    return {
+        "codes": [[w.code for w in res.warnings] for res in (first, second, last)],
+        "asked": [down.asked, held.asked, up.asked],
+        "state": state,
+    }
+
+
 async def write(graph):
     from selfgraph.models import CypherResult
 
@@ -2407,6 +2459,7 @@ async def write(graph):
     out["preference_delete_counts"] = await preference_delete_counts(graph)
     out["repeated_id_replays"] = await repeated_id_replays(graph)
     out["judge_window"] = await judge_window(graph)
+    out["judge_order"] = await judge_order(graph)
     return out
 
 

@@ -1,4 +1,4 @@
-import { judgeWritten, markPending, type Pending } from "../contradiction.js";
+import { judgeWritten, type Pending, pendingMarks, planPending } from "../contradiction.js";
 import { NotFoundError } from "../errors.js";
 import { pyStrip } from "../internal/py.js";
 import type {
@@ -107,10 +107,15 @@ export class Relations extends Resource {
         evidence,
       };
       const check = { ...conflicts, ...(strict && { contradiction: "strict" }) };
-      const created = await ops.createRelation(tx, ns, fields, this.graph.schemaCheck, { ...check, warnings });
-      if (judged && llm !== null)
-        pending.push(...(await markPending(tx, ns, [created], conflicts.caps, created.created_at)));
-      return created;
+      const stamp = async (planned: Relation[]) => {
+        pending.push(...(await planPending(tx, ns, planned, conflicts.caps, planned[0]!.created_at)));
+        return pendingMarks(pending);
+      };
+      return await ops.createRelation(tx, ns, fields, this.graph.schemaCheck, {
+        ...check,
+        warnings,
+        ...(judged && llm !== null ? { stamp } : {}),
+      });
     });
     if (judged && llm !== null) {
       const [notes] = await judgeWritten(this.graph, llm, [rel], pending, conflicts.caps);

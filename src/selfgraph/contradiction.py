@@ -15,7 +15,7 @@ from .errors import ExtractionError
 from .models import InsertWarning, Relation
 from .protocols import LLMClient
 
-__all__ = ["PENDING", "Pending", "apply_verdicts", "ask_judge", "mark_pending", "pending_judgments"]
+__all__ = ["PENDING", "Pending", "apply_verdicts", "ask_judge", "pending_judgments", "pending_marks", "plan_pending"]
 
 _MAX_RIVALS = 20
 PENDING = "judge_pending_json"
@@ -50,6 +50,8 @@ class Pending(NamedTuple):
     source_id: str | None
     source_version: str | None
     deferred: list[str]
+    carried: tuple[tuple[int, str], ...] = ()
+    at: str | None = None
 
 
 def _encode(item: Pending) -> str:
@@ -58,17 +60,16 @@ def _encode(item: Pending) -> str:
     @param item (Pending): the pending judgment.
     @return (str): the marker JSON.
     """
-    return _dumps(
-        {
-            "batch": item.batch,
-            "source_id": item.source_id,
-            "source_version": item.source_version,
-            "deferred": item.deferred,
-        }
-    )
+    marker = {
+        "batch": item.batch,
+        "source_id": item.source_id,
+        "source_version": item.source_version,
+        "deferred": item.deferred,
+    }
+    return _dumps({**marker, "at": item.at} if item.at is not None else marker)
 
 
-async def mark_pending(
+async def plan_pending(
     runner: Any,
     ns: str,
     written: list[Relation],
@@ -79,17 +80,20 @@ async def mark_pending(
     source_version: str | None = None,
     stale: Iterable[str] = (),
 ) -> list[Pending]:
-    """Mark each relation a write created or revised that has a rival as pending judgment, inside that write.
+    """Find each relation a write is about to create or revise that has a rival, so the write marks it pending.
+
+    The write stores each mark on the relation version itself (see pending_marks), in the statement that writes the
+    version, so the relation and its mark commit together even on an auto-commit store.
 
     @param runner (Any): graph runner, inside the write.
     @param ns (str): namespace.
-    @param written (list[Relation]): the relations the write stored.
+    @param written (list[Relation]): the relations the write is about to store, as planned.
     @param caps (Mapping[str, RelationCap] | None): the schema's max_count limits by relation type.
     @param written_at (datetime): the write's timestamp; only relations it created or revised are judged.
     @param source_id (str | None): the source a replace_source insert replaces.
     @param source_version (str | None): the version that insert recorded.
     @param stale (Iterable[str]): the relations that replacement would retire; rivals among them are deferred.
-    @return (list[Pending]): the pending judgments written.
+    @return (list[Pending]): the pending judgments to mark.
     """
     fresh = {r.id: r for r in written if r.created_at == written_at}
     rivals = await _ops.rival_relations(runner, ns, written, caps, _MAX_RIVALS)
@@ -101,37 +105,70 @@ async def mark_pending(
             continue
         batch = sorted({r.id for r in written if r.from_entity == rel.from_entity} - {rid})
         deferred = sorted(stale & {e["props"]["id"] for e in edges}) if source_version is not None else []
-        item = Pending(rel, batch, source_id, source_version, deferred)
-        await runner.update_current_edge(ns, rid, {PENDING: _encode(item)})
-        pending.append(item)
+        pending.append(Pending(rel, batch, source_id, source_version, deferred))
     return pending
 
 
-async def pending_judgments(runner: Any, ns: str, sources: Iterable[str], skip: set[str]) -> list[list[Pending]]:
+def pending_marks(pending: Iterable[Pending]) -> dict[str, dict[str, str]]:
+    """Give the marker property each pending relation's version is written with.
+
+    @param pending (Iterable[Pending]): the pending judgments from plan_pending.
+    @return (dict[str, dict[str, str]]): each relation id mapped to the properties to add to its new version.
+    """
+    return {item.relation.id: {PENDING: _encode(item)} for item in pending}
+
+
+async def pending_judgments(
+    runner: Any, ns: str, sources: Iterable[str], skip: set[tuple[str, int]]
+) -> list[list[Pending]]:
     """Read the pending judgments left on relation versions from some entities, one group per write, oldest first.
+
+    A mark on a version that a newer revision of the same relation replaced, with no mark of its own, is carried to
+    that revision: the judgment is asked about the current version and settles the old mark with it. Any other mark
+    on a version that is no longer current only finishes its deferred source step and is cleared.
 
     @param runner (Any): graph runner.
     @param ns (str): namespace.
     @param sources (Iterable[str]): the source entity ids.
-    @param skip (set[str]): relation ids to leave out.
+    @param skip (set[tuple[str, int]]): relation versions to leave out, by id and revision.
     @return (list[list[Pending]]): the pending judgments, grouped by the write that stored them.
     """
-    groups: dict[str, dict[tuple[str, int], Pending]] = {}
+    marked: list[tuple[str, dict, dict]] = []
+    live: dict[str, dict] = {}
     for source in sorted(set(sources)):
         fetch = partial(runner.match_edges, ns, from_label=L_ENTITY, to_label=L_ENTITY, from_id=source)
         for edge in await _ops._paged(fetch, page=_ops._BATCH):
             props = edge["props"]
-            if not props.get(PENDING) or props["id"] in skip:
-                continue
-            marker = _loads(props[PENDING], {})
-            item = Pending(
-                _ops._relation_of(edge),
-                list(marker.get("batch") or []),
-                marker.get("source_id"),
-                marker.get("source_version"),
-                list(marker.get("deferred") or []),
-            )
-            groups.setdefault(props["created_at"], {})[(props["id"], _ops._revision(edge))] = item
+            if props.get("is_current"):
+                live[props["id"]] = edge
+            if props.get(PENDING) and (props["id"], _ops._revision(edge)) not in skip:
+                marker = _loads(props[PENDING], {})
+                marked.append((marker.get("at") or props["created_at"], marker, edge))
+    groups: dict[str, dict[tuple[str, int], Pending]] = {}
+    carrying: set[str] = set()
+    for at, marker, edge in sorted(marked, key=lambda m: (m[0], m[2]["props"]["id"], _ops._revision(m[2]))):
+        rid = edge["props"]["id"]
+        subject, carried = edge, ()
+        newer = live.get(rid)
+        if (
+            not edge["props"].get("is_current")
+            and newer is not None
+            and not newer["props"].get(PENDING)
+            and _ops._revision(newer) > _ops._revision(edge)
+            and rid not in carrying
+        ):
+            subject, carried = newer, ((_ops._revision(edge), edge["props"]["created_at"]),)
+            carrying.add(rid)
+        item = Pending(
+            _ops._relation_of(subject),
+            list(marker.get("batch") or []),
+            marker.get("source_id"),
+            marker.get("source_version"),
+            list(marker.get("deferred") or []),
+            carried,
+            at,
+        )
+        groups.setdefault(at, {})[(rid, _ops._revision(edge))] = item
     return [list(group.values()) for _, group in sorted(groups.items())]
 
 
@@ -189,11 +226,17 @@ async def ask_judge(
                 code="invalid_llm_output",
                 field="retired",
             ) from exc
-        for number in dict.fromkeys(verdict.retired):
-            if 1 <= number <= len(open_edges):
-                edge = open_edges[number - 1]
-                taken.add(edge["props"]["id"])
-                chosen.append((new, edge))
+        numbers = list(dict.fromkeys(verdict.retired))
+        if any(not 1 <= number <= len(open_edges) for number in numbers):
+            raise ExtractionError(
+                f"LLM client returned a contradiction verdict outside 1..{len(open_edges)}: {numbers}",
+                code="invalid_llm_output",
+                field="retired",
+            )
+        for number in numbers:
+            edge = open_edges[number - 1]
+            taken.add(edge["props"]["id"])
+            chosen.append((new, edge))
     return chosen
 
 
@@ -240,8 +283,13 @@ async def apply_verdicts(
     pending: list[Pending],
     chosen: list[tuple[Relation, dict]] | None,
     known: datetime,
-) -> tuple[list[InsertWarning], list[str]]:
-    """Retire what the judge chose and settle the pending judgments, skipping any relation changed since it was judged.
+) -> tuple[list[InsertWarning], list[str], bool]:
+    """Retire what the judge chose and settle the pending judgments, keeping pending any the write cannot settle.
+
+    A judgment stays pending, with its mark on the relation's current version, when the judge failed, when a rival
+    it chose changed since it was judged, or when a newer revision replaced the judged relation; the next judged
+    write from the entity asks again about the versions then current. A mark on a relation with no current version,
+    or one deleted and created again, is cleared after its deferred source step.
 
     @param runner (Any): graph runner, inside the write.
     @param ns (str): namespace.
@@ -249,30 +297,42 @@ async def apply_verdicts(
     @param chosen (list[tuple[Relation, dict]] | None): the verdicts from ask_judge, or None when the judge failed,
         which keeps the judgments pending.
     @param known (datetime): the timestamp of this write, stamped on each retirement.
-    @return (tuple[list[InsertWarning], list[str]]): the warnings, and the relations the deferred source replacements
-        retired.
+    @return (tuple[list[InsertWarning], list[str], bool]): the warnings, the relations the deferred source
+        replacements retired, and whether every judgment settled.
     """
     for source in sorted(_ops._dedup_list(p.relation.from_entity for p in pending)):
         await runner.lock_node(ns, L_ENTITY, source)
-    live: set[str] = set()
-    held: dict[str, tuple[Pending, dict]] = {}
+    live: dict[str, dict] = {}
+    moved: dict[str, dict] = {}
+    held: dict[str, tuple[Pending, list[dict]]] = {}
     for item in pending:
         rel = item.relation
         edge = await _claimed_current(runner, ns, rel.id)
-        if edge is None or not _same(edge, rel):
+        marks: list[dict] = []
+        if edge is not None and _same(edge, rel):
+            if edge["props"].get(PENDING) or item.carried:
+                live[rel.id] = edge
+        else:
+            if edge is not None and _ops._revision(edge) > rel.revision and not edge["props"].get(PENDING):
+                moved[rel.id] = edge
+            marks = [v for v in await runner.list_edge_versions(ns, rel.id) if _same(v, rel)]
+        if item.carried:
             versions = await runner.list_edge_versions(ns, rel.id)
-            edge = next((v for v in versions if _same(v, rel)), None)
-        elif edge["props"].get(PENDING):
-            live.add(rel.id)
-        if edge is not None and edge["props"].get(PENDING):
-            held[rel.id] = (item, edge)
+            marks += [v for v in versions if _version(v) in set(item.carried)]
+        marks = [v for v in marks if v["props"].get(PENDING)]
+        if rel.id in live or marks:
+            held[rel.id] = (item, marks)
     retirements: list[tuple[dict, str, datetime]] = []
     kept: list[InsertWarning] = []
+    changed: dict[str, None] = {}
     for asked, judged in chosen or []:
         if asked.id not in live:
             continue
         edge = await _claimed_current(runner, ns, judged["props"]["id"])
-        if edge is None or _version(edge) != _version(judged):
+        if edge is None:
+            continue
+        if _version(edge) != _version(judged):
+            changed[asked.id] = None
             continue
         if edge["props"].get("certified_at") is None:
             retirements.append((edge, asked.id, _ops.effective_time(asked)))
@@ -290,24 +350,29 @@ async def apply_verdicts(
         )
         for rel in retired
     ]
+    stale = sorted({*changed, *(rid for rid in moved if rid in held)})
+    if stale:
+        message = f"the LLM answered about versions that have since changed, so {', '.join(stale)} stay pending"
+        warnings.append(InsertWarning(code="contradiction_not_judged", message=message))
     deferred: dict[tuple[str, str], set[str]] = {}
     for item, _ in held.values():
         if item.deferred and item.source_id is not None and item.source_version is not None:
             deferred.setdefault((item.source_id, item.source_version), set()).update(item.deferred)
     by_source: list[str] = []
-    for (source_id, version), stale in sorted(deferred.items()):
-        gone, notes = await _ops.replace_source_late(runner, ns, source_id, version, stale, known)
+    for (source_id, version), stale_ids in sorted(deferred.items()):
+        gone, notes = await _ops.replace_source_late(runner, ns, source_id, version, stale_ids, known)
         by_source.extend(gone)
         warnings.extend(notes)
-    for rid, (item, edge) in held.items():
-        marker = _encode(item._replace(deferred=[])) if chosen is None and rid in live else None
-        if rid in live:
+    settled = True
+    for rid, (item, marks) in held.items():
+        open_judgment = (rid in live and (chosen is None or rid in changed)) or rid in moved
+        settled = settled and not open_judgment
+        at = item.at or _ops.to_iso(item.relation.created_at)
+        marker = _encode(item._replace(deferred=[], carried=(), at=at)) if open_judgment else None
+        target = live.get(rid) or moved.get(rid)
+        if target is not None and (open_judgment or target["props"].get(PENDING)):
             await runner.update_current_edge(ns, rid, {PENDING: marker})
-        else:
-            await runner.create_edges(
-                ns,
-                L_ENTITY,
-                L_ENTITY,
-                [(edge["type"], edge["from_id"], edge["to_id"], {**edge["props"], PENDING: marker})],
-            )
-    return warnings, by_source
+        rows = [(v["type"], v["from_id"], v["to_id"], {**v["props"], PENDING: None}) for v in marks]
+        if rows:
+            await runner.create_edges(ns, L_ENTITY, L_ENTITY, rows)
+    return warnings, by_source, settled

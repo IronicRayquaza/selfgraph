@@ -1917,6 +1917,51 @@ async function judgeWindow(graph: SelfGraph): Promise<Record<string, unknown>> {
   return out;
 }
 
+async function judgeOrder(graph: SelfGraph): Promise<Record<string, unknown>> {
+  class Judge {
+    readonly asked: string[] = [];
+    constructor(private readonly fails: string | null) {}
+
+    async generate<T>(args: { system: string; user: string; output: { parse(value: unknown): T } }): Promise<T> {
+      const head = args.user.split("\n")[0]!;
+      this.asked.push(head);
+      if (this.fails !== null && head.includes(this.fails)) throw new Error("judge down");
+      const older = args.user.split("Older facts:\n")[1]!.split("\nWhich")[0]!;
+      return args.output.parse({ retired: older.split("\n").map((_, i) => i + 1) });
+    }
+  }
+  const ns = `${graph.namespace}_judge_order`;
+  const names = ["acme", "globex", "initech"];
+  const rids = names.map((name) => ids.relationId("person:ann", "WORKS_AT", `company:${name}`));
+  const people = [
+    { type: "Person", name: "Ann" },
+    ...names.map((n) => ({ type: "Company", name: n[0]!.toUpperCase() + n.slice(1) })),
+  ];
+  const fact = (company: string, year: number) => ({
+    from_entity: "person:ann",
+    type: "WORKS_AT",
+    to_entity: `company:${company}`,
+    event_time: `${year}-01-01T00:00:00Z`,
+  });
+  const graphWith = (judge: Judge) => new SelfGraph(graph.store, { namespace: ns, llm: judge, contradiction: "llm" });
+  const [down, held, up] = [new Judge("Globex"), new Judge("Globex"), new Judge(null)];
+  await graphWith(down).insert.facts({ entities: people, relations: [fact("acme", 2020)] });
+  const first = await graphWith(down).insert.facts({ relations: [fact("globex", 2022)] });
+  const second = await graphWith(held).insert.facts({ relations: [fact("initech", 2024)] });
+  const last = await graphWith(up).insert.facts({ relations: [fact("initech", 2024)] });
+  const state: unknown[] = [];
+  for (const rid of rids) {
+    const version = (await graphWith(up).relations.versions(rid)).at(-1)!;
+    const at = version.invalidated_at ? jsonIso(version.invalidated_at) : null;
+    state.push([rid, version.is_current, version.invalidated_by, at]);
+  }
+  return {
+    codes: [first, second, last].map((res) => res.warnings.map((w) => w.code)),
+    asked: [down.asked, held.asked, up.asked],
+    state,
+  };
+}
+
 async function repeatedIdReplays(graph: SelfGraph): Promise<unknown[]> {
   const g = new SelfGraph(graph.store, { namespace: `${graph.namespace}_repeated_ids` });
   await g.insert.facts({
@@ -2822,6 +2867,7 @@ export async function write(graph: SelfGraph): Promise<Record<string, unknown>> 
   out.preference_delete_counts = await preferenceDeleteCounts(graph);
   out.repeated_id_replays = await repeatedIdReplays(graph);
   out.judge_window = await judgeWindow(graph);
+  out.judge_order = await judgeOrder(graph);
   return out;
 }
 

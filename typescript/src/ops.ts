@@ -2720,6 +2720,9 @@ function retiredEdge(edge: EdgeRow, by: string, at: Date, known: Date, inPlace =
   return { ...edge, props };
 }
 
+/** Given relation versions as a write planned them, the properties to add to the new ones, by relation id. */
+export type Stamp = (planned: Relation[]) => Promise<ReadonlyMap<string, Props>>;
+
 export interface ContradictionOptions {
   dry_run?: boolean;
   contradiction?: string;
@@ -2727,6 +2730,8 @@ export interface ContradictionOptions {
   warnings?: InsertWarning[];
   /** For each relation input, each evidence record's statements (see planEvidence); omitted for all direct. */
   via?: ReadonlyArray<ReadonlyArray<readonly string[]>>;
+  /** Properties to add to the new versions, which land in the statement that writes each version. */
+  stamp?: Stamp;
 }
 
 /**
@@ -3188,6 +3193,14 @@ export async function upsertRelations(
     (writes.has(key) ? writes : retires).set(key, [old, gone.props]);
     current.set(old, gone);
   }
+  if (options.stamp !== undefined && !options.dry_run) {
+    const planned = plannedRelations(out, writes, retires, current);
+    for (const [rid, extra] of await options.stamp(inputs.map(({ rid }) => planned.get(rid)!))) {
+      const key = JSON.stringify([rid, planned.get(rid)!.revision]);
+      const write = writes.get(key);
+      if (write !== undefined) writes.set(key, [rid, { ...write[1], ...extra }]);
+    }
+  }
 
   const batched = [writes, retires].map((batch): EdgeWrite[] =>
     [...batch.values()].map(([rid, props]) => {
@@ -3214,13 +3227,32 @@ export async function upsertRelations(
     for (const rid of dedupList(out.map(([rid]) => rid))) stored.set(rid, (await newestRelation(runner, ns, rid))!);
     return inputs.map(({ rid }) => stored.get(rid)!);
   }
+  const result = plannedRelations(out, writes, retires, current);
+  return inputs.map(({ rid }) => result.get(rid)!);
+}
+
+/**
+ * Give each relation an upsert touched as the version it writes, or the stored one it leaves alone.
+ *
+ * @param out (ReadonlyArray<readonly [string, number, Relation]>): each folded input's id, revision, and version.
+ * @param writes (ReadonlyMap<string, readonly [string, Props]>): the new versions to write, by id and revision.
+ * @param retires (ReadonlyMap<string, readonly [string, Props]>): the retirements to write, by id and revision.
+ * @param current (ReadonlyMap<string, EdgeRow>): each relation's edge row as planned.
+ * @return (Map<string, Relation>): the versions by relation id.
+ */
+function plannedRelations(
+  out: ReadonlyArray<readonly [string, number, Relation]>,
+  writes: ReadonlyMap<string, readonly [string, Props]>,
+  retires: ReadonlyMap<string, readonly [string, Props]>,
+  current: ReadonlyMap<string, EdgeRow>,
+): Map<string, Relation> {
   const result = new Map<string, Relation>();
   for (const [rid, revision, rel] of out) {
     const key = JSON.stringify([rid, revision]);
     const final = retires.get(key) ?? writes.get(key);
     result.set(rid, final === undefined ? rel : relationOf({ ...current.get(rid)!, props: final[1] }));
   }
-  return inputs.map(({ rid }) => result.get(rid)!);
+  return result;
 }
 
 export interface CreateRelationArgs {
@@ -3325,6 +3357,10 @@ export async function createRelation(
   precheckEdges(runner, ns, L_ENTITY, L_ENTITY, [[ends.type, ends.from_entity, ends.to_entity, written], ...retired]);
   if (options.dry_run)
     return relationOf({ type: rtype, from_id: args.from_entity, to_id: args.to_entity, props: written });
+  if (options.stamp !== undefined) {
+    const planned = relationOf({ type: rtype, from_id: args.from_entity, to_id: args.to_entity, props: written });
+    written = { ...written, ...(await options.stamp([planned])).get(rid) };
+  }
   const rel = await writeRelationVersion(runner, ns, ends, written, null);
   if (retired.length) await runner.createEdges(ns, L_ENTITY, L_ENTITY, retired);
   await writeEvidence(runner, ns, records, createdAt);

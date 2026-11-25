@@ -1,5 +1,5 @@
 import type { GraphAccess } from "./access.js";
-import { judgeWritten, markPending, type Pending } from "./contradiction.js";
+import { judgeWritten, type Pending, pendingMarks, planPending } from "./contradiction.js";
 import { ExtractionError, errorMessage, SelfGraphError, ValidationError } from "./errors.js";
 import { NERExtractor } from "./extraction/basic.js";
 import { LLMExtractor } from "./extraction/extractor.js";
@@ -23,6 +23,7 @@ import {
   type ParsedDocument,
   type ParsedExtraction,
   parseOrThrow,
+  type Relation,
   type SourceDiff,
   type Status,
 } from "./models.js";
@@ -305,27 +306,34 @@ export class Insert {
         (rel) => [rel, ops.relationEvidence(rel.evidence, baseEvidence, source.source_id, sourceVersion)] as const,
       );
       const via = resolution && items.map(([rel, ev]) => ev.map(() => statementsOf(resolution, rel)));
+      const replacing = source.replace_source && source.source_id !== null && sourceVersion !== null;
+      const incomplete = source.warnings.some((w) => w.code === "extraction_partial_failure" && w.chunk_id !== null);
+      const staleOf = (planned: readonly Relation[]): Set<string> => {
+        const ids = new Set(planned.map((r) => r.id));
+        return new Set(replacing && !incomplete ? [...prior].filter((id) => !ids.has(id)) : []);
+      };
+      const stamp = async (planned: Relation[]) => {
+        pending.push(
+          ...(await planPending(tx, ns, planned, caps, createdAt, {
+            sourceId: source.source_id,
+            sourceVersion,
+            stale: staleOf(planned),
+          })),
+        );
+        return pendingMarks(pending);
+      };
       const relations = await ops.upsertRelations(tx, ns, items, source.default_event_time, createdAt, {
         contradiction: conflicts,
         caps,
         warnings: found,
         ...(via ? { via } : {}),
+        ...(judged && llm !== null ? { stamp } : {}),
       });
 
       let diff: SourceDiff | null = null;
-      const replacing = source.replace_source && source.source_id !== null && sourceVersion !== null;
-      const incomplete = source.warnings.some((w) => w.code === "extraction_partial_failure" && w.chunk_id !== null);
       const produced = new Set(relations.map((r) => r.id));
-      const stale = new Set(replacing && !incomplete ? [...prior].filter((id) => !produced.has(id)) : []);
-      if (judged && llm !== null) {
-        const marked = await markPending(tx, ns, relations, caps, createdAt, {
-          sourceId: source.source_id,
-          sourceVersion,
-          stale,
-        });
-        pending.push(...marked);
-        for (const item of marked) for (const rid of item.deferred) stale.delete(rid);
-      }
+      const stale = staleOf(relations);
+      for (const item of pending) for (const rid of item.deferred) stale.delete(rid);
       if (replacing && source.source_id !== null && sourceVersion !== null) {
         const at = source.default_event_time ?? createdAt;
         const [retired, notes] = incomplete

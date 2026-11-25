@@ -114,6 +114,7 @@ _BATCH = 1000
 _RELATION_ID_BATCH = 256
 
 SchemaCheck = Callable[..., Awaitable[None]]
+Stamp = Callable[[list[Relation]], Awaitable[Mapping[str, Mapping[str, Any]]]]
 
 
 def _require_id_size(kind: str, oid: str) -> None:
@@ -2856,6 +2857,7 @@ async def upsert_relations(
     warnings: list[InsertWarning] | None = None,
     via: list[list[list[str]]] | None = None,
     dry_run: bool = False,
+    stamp: Stamp | None = None,
 ) -> list[Relation]:
     """Insert-semantics upsert of many relations: merge properties, versioning on change, recording evidence.
 
@@ -2882,6 +2884,8 @@ async def upsert_relations(
     @param via (list[list[list[str]]] | None): for each input, each evidence record's statements (see _plan_evidence);
         None for all direct.
     @param dry_run (bool): compute relation versions without writing them.
+    @param stamp (Stamp | None): given the versions as planned, in input order, returns properties to add to the new
+        versions by relation id, which land in the statement that writes each version.
     @return (list[Relation]): each input's stored version, in input order.
     """
     inputs = []
@@ -3023,6 +3027,12 @@ async def upsert_relations(
         key = (old, gone["props"]["revision"])
         (writes if key in writes else retires)[key] = gone["props"]
         current[old] = gone
+    if stamp is not None and not dry_run:
+        planned = _planned_relations(out, {**writes, **retires}, current)
+        for rid, extra in (await stamp([planned[rid] for rid, *_ in inputs])).items():
+            key = (rid, planned[rid].revision)
+            if key in writes:
+                writes[key] = {**writes[key], **extra}
 
     batches = [
         [
@@ -3043,12 +3053,25 @@ async def upsert_relations(
             rid: await _newest_edge(runner, ns, rid, _is_relation_type) for rid in _dedup_list(r for r, _, _ in out)
         }
         return [_relation_of(stored[rid]) for rid, *_ in inputs]
-    final = {**writes, **retires}
+    result = _planned_relations(out, {**writes, **retires}, current)
+    return [result[rid] for rid, *_ in inputs]
+
+
+def _planned_relations(
+    out: list[tuple[str, int, Relation]], final: Mapping[tuple[str, int], dict], current: Mapping[str, dict]
+) -> dict[str, Relation]:
+    """Give each relation an upsert touched as the version it writes, or the stored one it leaves alone.
+
+    @param out (list[tuple[str, int, Relation]]): each folded input's id, revision, and version.
+    @param final (Mapping[tuple[str, int], dict]): the encoded versions to write, by id and revision.
+    @param current (Mapping[str, dict]): each relation's edge row as planned.
+    @return (dict[str, Relation]): the versions by relation id.
+    """
     result = {}
     for rid, revision, rel in out:
         props = final.get((rid, revision))
         result[rid] = rel if props is None else _relation_of({**current[rid], "props": props})
-    return [result[rid] for rid, *_ in inputs]
+    return result
 
 
 async def create_relation(
@@ -3067,6 +3090,7 @@ async def create_relation(
     caps: Mapping[str, RelationCap] | None = None,
     warnings: list[InsertWarning] | None = None,
     dry_run: bool = False,
+    stamp: Stamp | None = None,
 ) -> Relation:
     """Create one relation version, failing if the id already exists unless a contradiction invalidated it.
 
@@ -3091,6 +3115,8 @@ async def create_relation(
     @param caps (Mapping[str, RelationCap] | None): the schema's max_count limits by relation type.
     @param warnings (list[InsertWarning] | None): receives the contradiction warnings.
     @param dry_run (bool): compute the relation version without writing it.
+    @param stamp (Stamp | None): given the version as planned, returns properties to add to it by relation id, which
+        land in the statement that writes it.
     @return (Relation): the created relation.
     """
     _require_text("relation from_entity", from_entity)
@@ -3142,6 +3168,9 @@ async def create_relation(
     await _precheck_edges(runner, ns, L_ENTITY, L_ENTITY, [(rtype, from_entity, to_entity, props), *retired])
     if dry_run:
         return _relation_of({"type": rtype, "from_id": from_entity, "to_id": to_entity, "props": props})
+    if stamp is not None:
+        planned = _relation_of({"type": rtype, "from_id": from_entity, "to_id": to_entity, "props": props})
+        props = {**props, **(await stamp([planned])).get(rid, {})}
     rel = await _write_relation_version(runner, ns, from_entity, rtype, to_entity, props, retire=None)
     if retired:
         await runner.create_edges(ns, L_ENTITY, L_ENTITY, retired)

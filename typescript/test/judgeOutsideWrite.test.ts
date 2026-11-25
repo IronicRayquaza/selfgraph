@@ -36,6 +36,19 @@ class Judge implements LLMClient {
   }
 }
 
+class EveryRival implements LLMClient {
+  readonly prompts: string[] = [];
+  constructor(private readonly fails: string | null = null) {}
+
+  async generate<T>(args: { system: string; user: string; output: z.ZodType<T> }): Promise<T> {
+    this.prompts.push(args.user);
+    if (this.fails !== null && args.user.includes(`New fact: Ann -[WORKS_AT]-> ${this.fails}`))
+      throw new Error("provider down");
+    const older = args.user.split("Older facts:\n")[1]!.split("\nWhich")[0]!;
+    return args.output.parse({ retired: older.split("\n").map((_, i) => i + 1) });
+  }
+}
+
 class FailingJudge implements LLMClient {
   readonly prompts: string[] = [];
 
@@ -102,6 +115,65 @@ function failTransactions(g: SelfGraph, pass: number, error: () => Error, times 
   };
 }
 
+const WRITES = new Set([
+  "upsertNode",
+  "upsertNodes",
+  "removeNodeLabel",
+  "deleteNode",
+  "deleteNodes",
+  "deleteNodesBy",
+  "createEdge",
+  "createEdges",
+  "updateCurrentEdge",
+  "deleteEdges",
+  "deleteEdgesTouchingByType",
+]);
+
+/**
+ * Call a hook before every store call a write makes inside the store's transactions.
+ *
+ * @param g (SelfGraph): the graph.
+ * @param hook ((name: string, args: unknown[]) => void): called with each method name and its arguments; it may throw.
+ * @return (void): nothing.
+ */
+function watchWrites(g: SelfGraph, hook: (name: string, args: unknown[]) => void): void {
+  const store = g.store as unknown as { transaction: <T>(fn: (tx: GraphPrimitives) => Promise<T>) => Promise<T> };
+  const original = store.transaction.bind(store);
+  store.transaction = <T>(fn: (tx: GraphPrimitives) => Promise<T>): Promise<T> =>
+    original((tx) =>
+      fn(
+        new Proxy(tx, {
+          get(target, prop, receiver) {
+            const value = Reflect.get(target, prop, receiver);
+            if (typeof value !== "function") return value;
+            return (...args: unknown[]) => {
+              hook(String(prop), args);
+              return value.apply(target, args);
+            };
+          },
+        }),
+      ),
+    );
+}
+
+/**
+ * Give the properties of the rows a store call writes for one relation id.
+ *
+ * @param name (string): the store method.
+ * @param args (unknown[]): its arguments.
+ * @param rid (string): the relation id.
+ * @return (Array<Record<string, unknown>>): the written rows' properties for that relation.
+ */
+function rowsFor(name: string, args: unknown[], rid: string): Array<Record<string, unknown>> {
+  const rows =
+    name === "createEdges"
+      ? (args[3] as Array<readonly [string, string, string, Record<string, unknown>]>).map((row) => row[3])
+      : name === "createEdge"
+        ? [args[6] as Record<string, unknown>]
+        : [];
+  return rows.filter((props) => props.id === rid);
+}
+
 function suite(spec: StoreSpec): void {
   const open = freshGraphs(spec, "judge");
 
@@ -127,33 +199,166 @@ function suite(spec: StoreSpec): void {
     expect(await marked(g, GLOBEX)).toBe(false);
   });
 
-  it("drops a judge verdict when the new relation changed while the LLM answered", async () => {
+  const livesIn = async (g: SelfGraph, llm: LLMClient): Promise<InsertResult> => {
+    if ((await g.entities.get("city:paris")) === null) await g.entities.create("Paris", "City");
+    return sameGraph(g, llm).insert.facts({
+      relations: [{ from_entity: "person:ann", type: "LIVES_IN", to_entity: "city:paris" }],
+    });
+  };
+  const anyMarked = async (g: SelfGraph, rid: string): Promise<boolean> =>
+    (await g.store.listEdgeVersions(g.namespace, rid)).some((v) => Boolean(v.props[PENDING]));
+
+  it("keeps a verdict on a new relation changed while the LLM answered pending on the new revision", async () => {
     const judge = new WritingLLM({ retired: [1] });
     const g = await annGraph(judge);
     judge.write = () => g.relations.update(GLOBEX, { set_properties: { role: "intern" } });
     const res = await g.insert.facts({ relations: [annAt("globex", 2022)] });
-    expect([judge.prompts.length, res.warnings]).toEqual([1, []]);
+    expect([judge.prompts.length, res.warnings.map((w) => w.code)]).toEqual([1, ["contradiction_not_judged"]]);
     expect(await current(g)).toEqual([ACME, GLOBEX].sort());
     expect((await g.relations.get(GLOBEX))!.revision).toBe(2);
+    expect(await marked(g, GLOBEX)).toBe(true);
+    const versions = await g.store.listEdgeVersions(g.namespace, GLOBEX);
+    expect(versions.filter((v) => v.props.revision === 1 && v.props[PENDING])).toEqual([]);
+    const later = new Judge();
+    await livesIn(g, later);
+    expect(later.prompts.map((p) => p.split("\n")[0])).toEqual(["New fact: Ann -[WORKS_AT]-> Globex {role=intern}"]);
+    expect((await current(g)).includes(ACME)).toBe(false);
+    expect(await marked(g, GLOBEX)).toBe(false);
   });
 
-  it.each(["rival", "new"])("drops a judge verdict when the %s relation is created again meanwhile", async (which) => {
+  it("keeps a verdict whose rival changed while the LLM answered pending and judges it again", async () => {
     const judge = new WritingLLM({ retired: [1] });
     const g = await annGraph(judge);
-    const [company, rid] = which === "rival" ? ["acme", ACME] : ["globex", GLOBEX];
-    judge.write = async () => {
-      await g.relations.delete(rid);
-      await g.relations.create("person:ann", "WORKS_AT", `company:${company}`, {
-        properties: { role: "temp" },
-        contradiction: "warn",
-      });
-    };
+    judge.write = () => g.relations.update(ACME, { set_properties: { role: "lead" } });
     const res = await g.insert.facts({ relations: [annAt("globex", 2022)] });
-    expect([judge.prompts.length, res.warnings]).toEqual([1, []]);
-    const now = new Map((await g.relations.list({ from_entity: "person:ann" })).items.map((r) => [r.id, r]));
-    expect([...now.keys()].sort()).toEqual([ACME, GLOBEX].sort());
-    expect([now.get(rid)!.revision, now.get(rid)!.properties]).toEqual([1, { role: "temp" }]);
+    expect(res.warnings.map((w) => w.code)).toEqual(["contradiction_not_judged"]);
+    expect(await current(g)).toEqual([ACME, GLOBEX].sort());
+    expect(await marked(g, GLOBEX)).toBe(true);
+    const later = new Judge();
+    await sameGraph(g, later).insert.facts({ relations: [annAt("globex", 2022)] });
+    expect(later.prompts.length).toBe(1);
+    expect(later.prompts[0]).toContain("1. Ann -[WORKS_AT]-> Acme {role=lead}");
+    expect(await current(g)).toEqual([GLOBEX]);
+    expect(await marked(g, GLOBEX)).toBe(false);
+    await sameGraph(g, later).insert.facts({ relations: [annAt("globex", 2022)] });
+    expect(later.prompts.length).toBe(1);
   });
+
+  it.each(["insert", "create"])(
+    "leaves a write cut off right after its relation row marked or unwritten (%s)",
+    async (via) => {
+      const g = await annGraph(new Judge());
+      let armed = true;
+      let stored = false;
+      watchWrites(g, (name, args) => {
+        if (!armed) return;
+        if (stored && WRITES.has(name)) {
+          armed = false;
+          throw new Error("process stopped");
+        }
+        if (rowsFor(name, args, GLOBEX).length) stored = true;
+      });
+      const write =
+        via === "insert"
+          ? g.insert.facts({ relations: [annAt("globex", 2022)] })
+          : g.relations.create("person:ann", "WORKS_AT", "company:globex", { event_time: "2022-01-01" });
+      await expect(write).rejects.toThrow("process stopped");
+      expect(stored).toBe(true);
+      expect(!(await current(g)).includes(GLOBEX) || (await marked(g, GLOBEX))).toBe(true);
+      const later = new Judge();
+      await sameGraph(g, later).insert.facts({ relations: [annAt("globex", 2022)] });
+      expect(later.prompts.length).toBe(1);
+      expect(await current(g)).toEqual([GLOBEX]);
+      expect(await marked(g, GLOBEX)).toBe(false);
+    },
+  );
+
+  it.each(["insert", "create"])("writes the pending mark in the row that stores the relation (%s)", async (via) => {
+    const g = await annGraph(new FailingJudge());
+    const rows: Array<Record<string, unknown>> = [];
+    watchWrites(g, (name, args) => {
+      rows.push(...rowsFor(name, args, GLOBEX));
+    });
+    if (via === "insert") await g.insert.facts({ relations: [annAt("globex", 2022)] });
+    else await g.relations.create("person:ann", "WORKS_AT", "company:globex", { event_time: "2022-01-01" });
+    expect(rows.length).toBe(1);
+    expect(rows[0]![PENDING]).toBeTruthy();
+    expect(await marked(g, GLOBEX)).toBe(true);
+  });
+
+  it("treats a verdict naming no listed rival as invalid and keeps the judgment pending", async () => {
+    const g = await annGraph(new Judge([2]));
+    const res = await g.insert.facts({ relations: [annAt("globex", 2022)] });
+    expect(res.warnings.map((w) => w.code)).toEqual(["contradiction_not_judged"]);
+    expect(res.warnings[0]!.message).toContain("outside 1..1: [2]");
+    expect(await current(g)).toEqual([ACME, GLOBEX].sort());
+    expect(await marked(g, GLOBEX)).toBe(true);
+    const later = new Judge();
+    await sameGraph(g, later).insert.facts({ relations: [annAt("globex", 2022)] });
+    expect(later.prompts.length).toBe(1);
+    expect(await current(g)).toEqual([GLOBEX]);
+  });
+
+  it("moves a pending judgment to the revision that replaced its relation", async () => {
+    const g = await annGraph(new FailingJudge());
+    await g.insert.facts({ relations: [annAt("globex", 2022)] });
+    await g.relations.update(GLOBEX, { set_properties: { role: "intern" } });
+    expect(await marked(g, GLOBEX)).toBe(false);
+    const later = new Judge();
+    const res = await livesIn(g, later);
+    expect(later.prompts.map((p) => p.split("\n")[0])).toEqual(["New fact: Ann -[WORKS_AT]-> Globex {role=intern}"]);
+    expect(res.warnings.map((w) => w.code)).toEqual(["relation_superseded"]);
+    expect((await current(g)).includes(ACME)).toBe(false);
+    expect(await anyMarked(g, GLOBEX)).toBe(false);
+    await livesIn(g, later);
+    expect(later.prompts.length).toBe(1);
+  });
+
+  it("holds a later judgment behind an older pending one so valid-time history stays in order", async () => {
+    const g = await annGraph(new FailingJudge());
+    await g.insert.facts({ relations: [annAt("globex", 2022)] });
+    await g.entities.create("Initech", "Company");
+    const initech = ids.relationId("person:ann", "WORKS_AT", "company:initech");
+    const res = await sameGraph(g, new EveryRival("Globex")).insert.facts({ relations: [annAt("initech", 2024)] });
+    expect(res.warnings.map((w) => w.code)).toEqual(["contradiction_not_judged", "contradiction_not_judged"]);
+    expect(res.warnings[1]!.message).toContain(`${initech} stay pending behind it`);
+    expect(await current(g)).toEqual([ACME, GLOBEX, initech].sort());
+    expect([await marked(g, GLOBEX), await marked(g, initech)]).toEqual([true, true]);
+    const later = new EveryRival();
+    await sameGraph(g, later).insert.facts({ relations: [annAt("initech", 2024)] });
+    expect(later.prompts.map((p) => p.split("\n")[0])).toEqual([
+      "New fact: Ann -[WORKS_AT]-> Globex",
+      "New fact: Ann -[WORKS_AT]-> Initech",
+    ]);
+    expect(await current(g)).toEqual([initech]);
+    const acme = (await g.relations.versions(ACME)).at(-1)!;
+    const globex = (await g.relations.versions(GLOBEX)).at(-1)!;
+    expect([acme.invalidated_by, acme.invalidated_at!.getUTCFullYear()]).toEqual([GLOBEX, 2022]);
+    expect([globex.invalidated_by, globex.invalidated_at!.getUTCFullYear()]).toEqual([initech, 2024]);
+  });
+
+  it.each(["rival", "new"])(
+    "rechecks a judge verdict when the %s relation is created again meanwhile",
+    async (which) => {
+      const judge = new WritingLLM({ retired: [1] });
+      const g = await annGraph(judge);
+      const [company, rid] = which === "rival" ? ["acme", ACME] : ["globex", GLOBEX];
+      judge.write = async () => {
+        await g.relations.delete(rid);
+        await g.relations.create("person:ann", "WORKS_AT", `company:${company}`, {
+          properties: { role: "temp" },
+          contradiction: "warn",
+        });
+      };
+      const res = await g.insert.facts({ relations: [annAt("globex", 2022)] });
+      const codes = which === "rival" ? ["contradiction_not_judged"] : [];
+      expect([judge.prompts.length, res.warnings.map((w) => w.code)]).toEqual([1, codes]);
+      const now = new Map((await g.relations.list({ from_entity: "person:ann" })).items.map((r) => [r.id, r]));
+      expect([...now.keys()].sort()).toEqual([ACME, GLOBEX].sort());
+      expect([now.get(rid)!.revision, now.get(rid)!.properties]).toEqual([1, { role: "temp" }]);
+      expect(await marked(g, GLOBEX)).toBe(which === "rival");
+    },
+  );
 
   it("shows a judged write before its verdict and knows the retirement only after", async () => {
     const g = await annGraph(new Judge());

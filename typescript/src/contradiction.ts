@@ -5,11 +5,12 @@ import { ExtractionError, StoreError, TransientError } from "./errors.js";
 import { dumps, loads } from "./internal/json.js";
 import { contextPayload } from "./internal/payload.js";
 import { comparePy, pyStr } from "./internal/py.js";
+import { toIso } from "./internal/time.js";
 import { L_ENTITY } from "./labels.js";
 import { summarizeError } from "./llm/index.js";
 import { type InsertWarning, insertWarning, type JsonObject, type Relation } from "./models.js";
 import * as ops from "./ops.js";
-import type { EdgeRow, GraphPrimitives, LLMClient, Props } from "./protocols.js";
+import type { EdgeRow, EdgeWrite, GraphPrimitives, LLMClient, Props } from "./protocols.js";
 import { decodeEntity } from "./serde.js";
 
 const MAX_RIVALS = 20;
@@ -44,6 +45,10 @@ export interface Pending {
   readonly source_id: string | null;
   readonly source_version: string | null;
   readonly deferred: readonly string[];
+  /** Marked versions of the relation that a newer revision replaced, by revision and created_at, settled with it. */
+  readonly carried?: ReadonlyArray<readonly [number, string]>;
+  /** The created_at of the write that marked it, which orders it among the pending judgments. */
+  readonly at?: string | null;
 }
 
 /**
@@ -53,26 +58,30 @@ export interface Pending {
  * @return (string): the marker JSON.
  */
 function encode(item: Pending): string {
-  return dumps({
+  const marker = {
     batch: item.batch,
     source_id: item.source_id,
     source_version: item.source_version,
     deferred: item.deferred,
-  });
+  };
+  return dumps(item.at === undefined || item.at === null ? marker : { ...marker, at: item.at });
 }
 
 /**
- * Mark each relation a write created or revised that has a rival as pending judgment, inside that write.
+ * Find each relation a write is about to create or revise that has a rival, so the write marks it pending.
+ *
+ * The write stores each mark on the relation version itself (see pendingMarks), in the statement that writes the
+ * version, so the relation and its mark commit together even on an auto-commit store.
  *
  * @param runner (GraphPrimitives): the graph runner, inside the write.
  * @param ns (string): the namespace.
- * @param written (readonly Relation[]): the relations the write stored.
+ * @param written (readonly Relation[]): the relations the write is about to store, as planned.
  * @param caps (ReadonlyMap<string, ops.RelationCap> | null): the schema's max_count limits by relation type.
  * @param writtenAt (Date): the write's timestamp; only relations it created or revised are judged.
  * @param source ({ sourceId?: string | null; sourceVersion?: string | null; stale?: Iterable<string> }): the source a replace_source insert replaces, the version it recorded, and the relations that replacement would retire; rivals among them are deferred.
- * @return (Pending[]): the pending judgments written.
+ * @return (Pending[]): the pending judgments to mark.
  */
-export async function markPending(
+export async function planPending(
   runner: GraphPrimitives,
   ns: string,
   written: readonly Relation[],
@@ -95,26 +104,32 @@ export async function markPending(
       sourceVersion === null
         ? []
         : [...new Set(edges.map((e) => e.props.id as string).filter((id) => stale.has(id)))].sort(comparePy);
-    const item: Pending = {
-      relation,
-      batch,
-      source_id: source.sourceId ?? null,
-      source_version: sourceVersion,
-      deferred,
-    };
-    await runner.updateCurrentEdge(ns, rid, { [PENDING]: encode(item) });
-    pending.push(item);
+    pending.push({ relation, batch, source_id: source.sourceId ?? null, source_version: sourceVersion, deferred });
   }
   return pending;
 }
 
 /**
+ * Give the marker property each pending relation's version is written with.
+ *
+ * @param pending (Iterable<Pending>): the pending judgments from planPending.
+ * @return (Map<string, Props>): each relation id mapped to the properties to add to its new version.
+ */
+export function pendingMarks(pending: Iterable<Pending>): Map<string, Props> {
+  return new Map([...pending].map((item) => [item.relation.id, { [PENDING]: encode(item) }]));
+}
+
+/**
  * Read the pending judgments left on relation versions from some entities, one group per write, oldest first.
+ *
+ * A mark on a version that a newer revision of the same relation replaced, with no mark of its own, is carried to
+ * that revision: the judgment is asked about the current version and settles the old mark with it. Any other mark
+ * on a version that is no longer current only finishes its deferred source step and is cleared.
  *
  * @param runner (GraphPrimitives): the graph runner.
  * @param ns (string): the namespace.
  * @param sources (Iterable<string>): the source entity ids.
- * @param skip (ReadonlySet<string>): relation ids to leave out.
+ * @param skip (ReadonlySet<string>): relation versions to leave out, as JSON [id, revision].
  * @return (Pending[][]): the pending judgments, grouped by the write that stored them.
  */
 export async function pendingJudgments(
@@ -123,24 +138,53 @@ export async function pendingJudgments(
   sources: Iterable<string>,
   skip: ReadonlySet<string>,
 ): Promise<Pending[][]> {
-  const groups = new Map<string, Map<string, Pending>>();
+  const marked: Array<readonly [string, Record<string, unknown>, EdgeRow]> = [];
+  const live = new Map<string, EdgeRow>();
   for (const source of [...new Set(sources)].sort(comparePy)) {
     const filter = { from_label: L_ENTITY, to_label: L_ENTITY, from_id: source };
     for (const edge of await ops.allEdges(runner, ns, filter)) {
       const props = edge.props;
-      if (!props[PENDING] || skip.has(props.id as string)) continue;
+      if (props.is_current) live.set(props.id as string, edge);
+      if (!props[PENDING] || skip.has(JSON.stringify([props.id, ops.revisionOf(edge)]))) continue;
       const marker = loads<Record<string, unknown>>(props[PENDING], {});
-      const item: Pending = {
-        relation: ops.relationOf(edge),
-        batch: (marker.batch as string[] | undefined) ?? [],
-        source_id: (marker.source_id as string | null | undefined) ?? null,
-        source_version: (marker.source_version as string | null | undefined) ?? null,
-        deferred: (marker.deferred as string[] | undefined) ?? [],
-      };
-      const key = props.created_at as string;
-      const group = groups.get(key) ?? new Map<string, Pending>();
-      groups.set(key, group.set(JSON.stringify([props.id, ops.revisionOf(edge)]), item));
+      marked.push([(marker.at as string | undefined) || (props.created_at as string), marker, edge]);
     }
+  }
+  marked.sort(
+    (a, b) =>
+      comparePy(a[0], b[0]) ||
+      comparePy(a[2].props.id as string, b[2].props.id as string) ||
+      ops.revisionOf(a[2]) - ops.revisionOf(b[2]),
+  );
+  const groups = new Map<string, Map<string, Pending>>();
+  const carrying = new Set<string>();
+  for (const [at, marker, edge] of marked) {
+    const rid = edge.props.id as string;
+    let subject = edge;
+    let carried: Array<readonly [number, string]> = [];
+    const newer = live.get(rid);
+    if (
+      !edge.props.is_current &&
+      newer !== undefined &&
+      !newer.props[PENDING] &&
+      ops.revisionOf(newer) > ops.revisionOf(edge) &&
+      !carrying.has(rid)
+    ) {
+      subject = newer;
+      carried = [[ops.revisionOf(edge), edge.props.created_at as string]];
+      carrying.add(rid);
+    }
+    const item: Pending = {
+      relation: ops.relationOf(subject),
+      batch: (marker.batch as string[] | undefined) ?? [],
+      source_id: (marker.source_id as string | null | undefined) ?? null,
+      source_version: (marker.source_version as string | null | undefined) ?? null,
+      deferred: (marker.deferred as string[] | undefined) ?? [],
+      carried,
+      at,
+    };
+    const group = groups.get(at) ?? new Map<string, Pending>();
+    groups.set(at, group.set(JSON.stringify([rid, ops.revisionOf(edge)]), item));
   }
   return [...groups].sort((a, b) => comparePy(a[0], b[0])).map(([, group]) => [...group.values()]);
 }
@@ -202,12 +246,17 @@ export async function askJudge(
         cause: error,
       });
     }
-    for (const number of new Set(verdict.retired)) {
-      if (number >= 1 && number <= open.length) {
-        const edge = open[number - 1]!;
-        taken.add(edge.props.id);
-        chosen.push([fresh, edge]);
-      }
+    const numbers = [...new Set(verdict.retired)];
+    if (numbers.some((number) => number < 1 || number > open.length)) {
+      throw new ExtractionError(
+        `LLM client returned a contradiction verdict outside 1..${open.length}: [${numbers.join(", ")}]`,
+        { code: "invalid_llm_output", field: "retired" },
+      );
+    }
+    for (const number of numbers) {
+      const edge = open[number - 1]!;
+      taken.add(edge.props.id);
+      chosen.push([fresh, edge]);
     }
   }
   return chosen;
@@ -256,14 +305,19 @@ async function claimedCurrent(runner: GraphPrimitives, ns: string, rid: string):
 }
 
 /**
- * Retire what the judge chose and settle the pending judgments, skipping any relation changed since it was judged.
+ * Retire what the judge chose and settle the pending judgments, keeping pending any the write cannot settle.
+ *
+ * A judgment stays pending, with its mark on the relation's current version, when the judge failed, when a rival it
+ * chose changed since it was judged, or when a newer revision replaced the judged relation; the next judged write from
+ * the entity asks again about the versions then current. A mark on a relation with no current version, or one
+ * deleted and created again, is cleared after its deferred source step.
  *
  * @param runner (GraphPrimitives): the graph runner, inside the write.
  * @param ns (string): the namespace.
  * @param pending (readonly Pending[]): the pending judgments from one write.
  * @param chosen (ReadonlyArray<readonly [Relation, EdgeRow]> | null): the verdicts from askJudge, or null when the judge failed, which keeps the judgments pending.
  * @param known (Date): the timestamp of this write, stamped on each retirement.
- * @return ([InsertWarning[], string[]]): the warnings, and the relations the deferred source replacements retired.
+ * @return ([InsertWarning[], string[], boolean]): the warnings, the relations the deferred source replacements retired, and whether every judgment settled.
  */
 export async function applyVerdicts(
   runner: GraphPrimitives,
@@ -271,28 +325,44 @@ export async function applyVerdicts(
   pending: readonly Pending[],
   chosen: ReadonlyArray<readonly [Relation, EdgeRow]> | null,
   known: Date,
-): Promise<[InsertWarning[], string[]]> {
+): Promise<[InsertWarning[], string[], boolean]> {
   for (const source of ops.dedupList(pending.map((p) => p.relation.from_entity)).sort(comparePy)) {
     await runner.lockNode(ns, L_ENTITY, source);
   }
-  const live = new Set<string>();
-  const held = new Map<string, readonly [Pending, EdgeRow]>();
+  const live = new Map<string, EdgeRow>();
+  const moved = new Map<string, EdgeRow>();
+  const held = new Map<string, readonly [Pending, EdgeRow[]]>();
   for (const item of pending) {
     const rel = item.relation;
-    let edge = await claimedCurrent(runner, ns, rel.id);
-    if (edge === null || !same(edge, rel)) {
-      edge = (await runner.listEdgeVersions(ns, rel.id)).find((v) => same(v, rel)) ?? null;
-    } else if (edge.props[PENDING]) {
-      live.add(rel.id);
+    const carried = item.carried ?? [];
+    const edge = await claimedCurrent(runner, ns, rel.id);
+    let marks: EdgeRow[] = [];
+    if (edge !== null && same(edge, rel)) {
+      if (edge.props[PENDING] || carried.length) live.set(rel.id, edge);
+    } else {
+      if (edge !== null && ops.revisionOf(edge) > rel.revision && !edge.props[PENDING]) moved.set(rel.id, edge);
+      marks = (await runner.listEdgeVersions(ns, rel.id)).filter((v) => same(v, rel));
     }
-    if (edge !== null && edge.props[PENDING]) held.set(rel.id, [item, edge]);
+    if (carried.length) {
+      const versions = await runner.listEdgeVersions(ns, rel.id);
+      marks.push(
+        ...versions.filter((v) => carried.some(([rev, at]) => ops.revisionOf(v) === rev && v.props.created_at === at)),
+      );
+    }
+    marks = marks.filter((v) => v.props[PENDING]);
+    if (live.has(rel.id) || marks.length) held.set(rel.id, [item, marks]);
   }
   const retirements: Array<readonly [EdgeRow, string, Date]> = [];
   const kept: InsertWarning[] = [];
+  const changed = new Set<string>();
   for (const [asked, judged] of chosen ?? []) {
     if (!live.has(asked.id)) continue;
     const edge = await claimedCurrent(runner, ns, judged.props.id as string);
-    if (edge === null || !sameVersion(edge, judged)) continue;
+    if (edge === null) continue;
+    if (!sameVersion(edge, judged)) {
+      changed.add(asked.id);
+      continue;
+    }
     if (edge.props.certified_at === null || edge.props.certified_at === undefined) {
       retirements.push([edge, asked.id, ops.effectiveTime(asked)]);
       continue;
@@ -310,6 +380,11 @@ export async function applyVerdicts(
       ),
     ),
   ];
+  const stale = [...new Set([...changed, ...[...moved.keys()].filter((rid) => held.has(rid))])].sort(comparePy);
+  if (stale.length) {
+    const message = `the LLM answered about versions that have since changed, so ${stale.join(", ")} stay pending`;
+    warnings.push(insertWarning("contradiction_not_judged", message));
+  }
   const deferred = new Map<string, [string, string, Set<string>]>();
   for (const [item] of held.values()) {
     if (!item.deferred.length || item.source_id === null || item.source_version === null) continue;
@@ -319,20 +394,24 @@ export async function applyVerdicts(
     deferred.set(key, entry);
   }
   const bySource: string[] = [];
-  for (const [, [sourceId, version, stale]] of [...deferred].sort((a, b) => comparePy(a[0], b[0]))) {
-    const [gone, notes] = await ops.replaceSourceLate(runner, ns, sourceId, version, stale, known);
+  for (const [, [sourceId, version, staleIds]] of [...deferred].sort((a, b) => comparePy(a[0], b[0]))) {
+    const [gone, notes] = await ops.replaceSourceLate(runner, ns, sourceId, version, staleIds, known);
     bySource.push(...gone);
     warnings.push(...notes);
   }
-  for (const [rid, [item, edge]] of held) {
-    const marker = chosen === null && live.has(rid) ? encode({ ...item, deferred: [] }) : null;
-    if (live.has(rid)) await runner.updateCurrentEdge(ns, rid, { [PENDING]: marker });
-    else
-      await runner.createEdges(ns, L_ENTITY, L_ENTITY, [
-        [edge.type, edge.from_id, edge.to_id, { ...edge.props, [PENDING]: marker }],
-      ]);
+  let settled = true;
+  for (const [rid, [item, marks]] of held) {
+    const open = (live.has(rid) && (chosen === null || changed.has(rid))) || moved.has(rid);
+    settled &&= !open;
+    const at = item.at ?? toIso(item.relation.created_at)!;
+    const marker = open ? encode({ ...item, deferred: [], carried: [], at }) : null;
+    const target = live.get(rid) ?? moved.get(rid);
+    if (target !== undefined && (open || target.props[PENDING]))
+      await runner.updateCurrentEdge(ns, rid, { [PENDING]: marker });
+    const rows: EdgeWrite[] = marks.map((v) => [v.type, v.from_id, v.to_id, { ...v.props, [PENDING]: null }]);
+    if (rows.length) await runner.createEdges(ns, L_ENTITY, L_ENTITY, rows);
   }
-  return [warnings, bySource];
+  return [warnings, bySource, settled];
 }
 
 /**
@@ -354,7 +433,12 @@ export async function judgeWritten(
   caps: ReadonlyMap<string, ops.RelationCap> | null,
   names: ReadonlyMap<string, string> = new Map(),
 ): Promise<[InsertWarning[], string[]]> {
-  const mine = new Set(pending.map((p) => p.relation.id));
+  const stored = new Map(written.map((r) => [r.id, r]));
+  const own = pending.map((p): Pending => {
+    const rel = stored.get(p.relation.id);
+    return rel !== undefined && rel.revision === p.relation.revision ? { ...p, relation: rel } : p;
+  });
+  const mine = new Set(own.map((p) => JSON.stringify([p.relation.id, p.relation.revision])));
   const left = await graph.read((store, ns) =>
     pendingJudgments(
       store,
@@ -367,13 +451,24 @@ export async function judgeWritten(
   const retired: string[] = [];
   const groups: Array<readonly [readonly Pending[], ReadonlyMap<string, string>]> = [
     ...left.map((g) => [g, new Map<string, string>()] as const),
-    [pending, names] as const,
+    [own, names] as const,
   ];
+  const blocked = new Set<string>();
+  const waiting = new Set<string>();
   for (const [group, stated] of groups) {
     if (!group.length) continue;
-    const [notes, gone] = await settle(graph, llm, group, caps, stated);
+    const sources = new Set(group.map((p) => p.relation.from_entity));
+    const held = [...sources].some((s) => blocked.has(s));
+    if (held) for (const p of group) waiting.add(p.relation.id);
+    const [notes, gone, settled] = await settle(graph, llm, group, caps, stated, !held);
     warnings.push(...notes);
     retired.push(...gone);
+    if (!settled) for (const s of sources) blocked.add(s);
+  }
+  if (waiting.size) {
+    const ids = [...waiting].sort(comparePy).join(", ");
+    const message = `an older judgment from the same entity is still pending, so ${ids} stay pending behind it`;
+    warnings.push(insertWarning("contradiction_not_judged", message));
   }
   return [warnings, retired];
 }
@@ -386,7 +481,8 @@ export async function judgeWritten(
  * @param group (readonly Pending[]): the pending judgments from one write.
  * @param caps (ReadonlyMap<string, ops.RelationCap> | null): the schema's max_count limits by relation type.
  * @param names (ReadonlyMap<string, string>): names of entities as the write stated them.
- * @return ([InsertWarning[], string[]]): the warnings, and the relations deferred source replacements retired.
+ * @param ask (boolean): false to leave the judgments pending without asking, still finishing deferred source steps.
+ * @return ([InsertWarning[], string[], boolean]): the warnings, the relations deferred source replacements retired, and whether every judgment settled.
  */
 async function settle(
   graph: GraphAccess,
@@ -394,7 +490,8 @@ async function settle(
   group: readonly Pending[],
   caps: ReadonlyMap<string, ops.RelationCap> | null,
   names: ReadonlyMap<string, string>,
-): Promise<[InsertWarning[], string[]]> {
+  ask = true,
+): Promise<[InsertWarning[], string[], boolean]> {
   const ids = group
     .map((p) => p.relation.id)
     .sort(comparePy)
@@ -402,17 +499,17 @@ async function settle(
   const failed: InsertWarning[] = [];
   let chosen: Array<readonly [Relation, EdgeRow]> | null = null;
   try {
-    chosen = await graph.read((store, ns) => askJudge(store, ns, llm, group, caps, names));
+    if (ask) chosen = await graph.read((store, ns) => askJudge(store, ns, llm, group, caps, names));
   } catch (exc) {
     const message = `the LLM contradiction judge failed, so ${ids} stay pending: ${summarizeError(exc)}`;
     failed.push(insertWarning("contradiction_not_judged", message));
   }
   try {
-    const [notes, retired] = await graph.write((tx, ns) => applyVerdicts(tx, ns, group, chosen, new Date()));
-    return [[...failed, ...notes], retired];
+    const [notes, retired, settled] = await graph.write((tx, ns) => applyVerdicts(tx, ns, group, chosen, new Date()));
+    return [[...failed, ...notes], retired, settled];
   } catch (exc) {
     if (!(exc instanceof TransientError) && !(exc instanceof StoreError)) throw exc;
     const message = `the LLM contradiction verdicts on ${ids} were not applied, so they stay pending: ${exc.message}`;
-    return [[...failed, insertWarning("contradiction_not_judged", message)], []];
+    return [[...failed, insertWarning("contradiction_not_judged", message)], [], false];
   }
 }

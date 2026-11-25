@@ -255,9 +255,11 @@ WARNING_HINTS: dict[str, str] = {
         "source changed on purpose."
     ),
     "contradiction_not_judged": (
-        'With `contradiction="llm"`, the judge failed or its verdicts could not be written after the write '
-        "committed, so the relations the message names stay pending. The next judged write from the same entity "
-        "judges them again; fix the LLM or store and nothing else is needed."
+        'With `contradiction="llm"`, the judge failed or gave an invalid verdict, its verdicts could not be written '
+        "after the write committed, the relations it judged changed before the verdicts were applied, or an older "
+        "judgment from the same entity is still pending, so the relations the message names stay pending. The next "
+        "judged write from the same entity judges them again, oldest first; fix the LLM or store and nothing else "
+        "is needed."
     ),
     "extraction_partial_failure": (
         "Some extraction calls or items failed, and the rest was inserted. The message names the failure, the "

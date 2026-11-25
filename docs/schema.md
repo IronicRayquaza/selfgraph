@@ -284,14 +284,22 @@ The judge is asked after the write commits, so no lock is held while the LLM
 answers. Its retirements are written by a second, short write, and their
 `invalidated_known_at` is when that write ran. Until then the new relation and
 its rival are both current, and a `known_at` read from that window shows both.
-A verdict is skipped when the new relation or the rival changed, or was deleted
-and created again, after the judge read it.
+A verdict is not applied to a relation or rival that changed, or was deleted
+and created again, after the judge read it. When a rival it chose changed or
+was created again, or the new relation has a newer revision, the judgment stays
+pending and is asked again about the versions then current.
 
-The write marks each relation it asks about as pending, and the second write
-clears the mark. If the judge fails, or the process stops before the second
-write, the mark stays and the result gets a `contradiction_not_judged` warning.
-The next judged write from the same source entity, including a rerun of the
-same insert, then judges it again.
+The write marks each relation it asks about as pending, in the same statement
+that stores the relation, so even an auto-commit store never keeps the relation
+without its mark. The second write clears the mark. If the judge fails or names
+a fact it was not shown, if the relation or a rival it chose changed meanwhile,
+or if the process stops before the second write, the mark stays and the result
+gets a `contradiction_not_judged` warning. The next judged write from the same
+source entity, including a rerun of the same insert, then judges it again. A
+mark left on a version that a later revision replaced moves to that revision.
+Pending judgments from an entity are settled oldest write first, and one that
+cannot settle holds back the later ones, so valid-time history is retired in
+the order the facts took effect.
 
 With `replace_source=True`, a stale relation the judge is asked about is not
 retired by the source until the judge answers. If the judge retires it, the new

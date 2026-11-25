@@ -14,7 +14,7 @@ from ._diff import graph_diff
 from ._export import obsidian_vault
 from ._maintenance import inspect, scan_entities, scan_relations
 from ._serde import L_TRACE, aware, now
-from .contradiction import Pending, apply_verdicts, ask_judge, mark_pending, pending_judgments
+from .contradiction import Pending, apply_verdicts, ask_judge, pending_judgments, pending_marks, plan_pending
 from .errors import CLOSED_MESSAGE, EMBEDDER_HINT, StoreError, TransientError, ValidationError, needs_llm
 from .extraction.extractor import LLMExtractor
 from .extraction.prompts import check_prompts
@@ -589,13 +589,21 @@ class SelfGraph:
         async def create(tx: Any) -> Any:
             found.clear()
             pending.clear()
-            check = self._schema_check
-            rel = await _ops.create_relation(
-                tx, self.namespace, **fields, schema_check=check, contradiction=mode, caps=caps, warnings=found
+
+            async def mark(planned: list[Relation]) -> dict[str, dict[str, str]]:
+                pending.extend(await plan_pending(tx, self.namespace, planned, caps, planned[0].created_at))
+                return pending_marks(pending)
+
+            return await _ops.create_relation(
+                tx,
+                self.namespace,
+                **fields,
+                schema_check=self._schema_check,
+                contradiction=mode,
+                caps=caps,
+                warnings=found,
+                stamp=mark if judged and self._llm is not None else None,
             )
-            if judged and self._llm is not None:
-                pending.extend(await mark_pending(tx, self.namespace, [rel], caps, rel.created_at))
-            return rel
 
         rel = await self._in_tx(create)
         if judged and self._llm is not None:
@@ -621,44 +629,76 @@ class SelfGraph:
             replacements retired.
         """
         reader = await self._reader()
-        mine = {p.relation.id for p in pending}
+        stored = {r.id: r for r in written}
+        pending = [
+            p._replace(relation=stored[p.relation.id])
+            if p.relation.id in stored and stored[p.relation.id].revision == p.relation.revision
+            else p
+            for p in pending
+        ]
+        mine = {(p.relation.id, p.relation.revision) for p in pending}
         left = await pending_judgments(reader, self.namespace, {r.from_entity for r in written}, mine)
         warnings: list[InsertWarning] = []
         retired: list[str] = []
+        blocked: set[str] = set()
+        waiting: list[str] = []
         for group, stated in [*((g, None) for g in left), (pending, names)]:
             if not group:
                 continue
-            notes, gone = await self._settle(reader, group, caps, stated)
+            sources = {p.relation.from_entity for p in group}
+            held = bool(sources & blocked)
+            if held:
+                waiting.extend(p.relation.id for p in group)
+            notes, gone, settled = await self._settle(reader, group, caps, stated, ask=not held)
             warnings.extend(notes)
             retired.extend(gone)
+            if not settled:
+                blocked |= sources
+        if waiting:
+            message = (
+                f"an older judgment from the same entity is still pending, so {', '.join(sorted(set(waiting)))} "
+                "stay pending behind it"
+            )
+            warnings.append(InsertWarning(code="contradiction_not_judged", message=message))
         return warnings, retired
 
     async def _settle(
-        self, reader: Any, group: list[Pending], caps: dict[str, Any], names: Mapping[str, str] | None
-    ) -> tuple[list[InsertWarning], list[str]]:
+        self,
+        reader: Any,
+        group: list[Pending],
+        caps: dict[str, Any],
+        names: Mapping[str, str] | None,
+        *,
+        ask: bool = True,
+    ) -> tuple[list[InsertWarning], list[str], bool]:
         """Ask the judge about one write's pending relations, then apply its verdicts in a short write.
 
         @param reader (Any): graph reader.
         @param group (list[Pending]): the pending judgments from one write.
         @param caps (dict[str, Any]): the schema's max_count limits by relation type.
         @param names (Mapping[str, str] | None): names of entities as the write stated them.
-        @return (tuple[list[InsertWarning], list[str]]): the warnings, and the relations deferred source
-            replacements retired.
+        @param ask (bool): False to leave the judgments pending without asking, still finishing deferred source steps.
+        @return (tuple[list[InsertWarning], list[str], bool]): the warnings, the relations deferred source
+            replacements retired, and whether every judgment settled.
         """
         ids = ", ".join(sorted(p.relation.id for p in group))
         failed: list[InsertWarning] = []
         chosen = None
+        llm: Any = self._llm
         try:
-            chosen = await ask_judge(reader, self.namespace, self._llm, group, caps, names)  # type: ignore[arg-type]
+            if ask:
+                chosen = await ask_judge(reader, self.namespace, llm, group, caps, names)
         except Exception as exc:  # noqa: BLE001
             message = f"the LLM contradiction judge failed, so {ids} stay pending: {summarize_error(exc)}"
             failed.append(InsertWarning(code="contradiction_not_judged", message=message))
         try:
-            notes, retired = await self._in_tx(lambda tx: apply_verdicts(tx, self.namespace, group, chosen, now()))
+            notes, retired, settled = await self._in_tx(
+                lambda tx: apply_verdicts(tx, self.namespace, group, chosen, now())
+            )
         except (TransientError, StoreError) as exc:
             message = f"the LLM contradiction verdicts on {ids} were not applied, so they stay pending: {exc}"
-            return [*failed, InsertWarning(code="contradiction_not_judged", message=message)], []
-        return [*failed, *notes], retired
+            return [*failed, InsertWarning(code="contradiction_not_judged", message=message)], [], False
+        return [*failed, *notes], retired, settled
 
     def _build_extractor(
         self,
@@ -804,6 +844,27 @@ class SelfGraph:
                 )
                 for rel in resolved.relations
             ]
+            replacing = replace_source and source_id is not None and source_version is not None
+            incomplete = any(w.code == "extraction_partial_failure" and w.chunk_id is not None for w in warnings)
+
+            def stale_of(planned: list[Relation]) -> set[str]:
+                return prior - {r.id for r in planned} if replacing and not incomplete else set()
+
+            async def mark(planned: list[Relation]) -> dict[str, dict[str, str]]:
+                pending.extend(
+                    await plan_pending(
+                        tx,
+                        ns,
+                        planned,
+                        caps,
+                        created_at,
+                        source_id=source_id,
+                        source_version=source_version,
+                        stale=stale_of(planned),
+                    )
+                )
+                return pending_marks(pending)
+
             relations = await _ops.upsert_relations(
                 tx,
                 ns,
@@ -814,18 +875,11 @@ class SelfGraph:
                 caps=caps,
                 warnings=found,
                 via=None if resolution is None else [[resolution.statements(rel)] * len(ev) for rel, ev in items],
+                stamp=mark if judged and self._llm is not None else None,
             )
 
             diff = None
-            replacing = replace_source and source_id is not None and source_version is not None
-            incomplete = any(w.code == "extraction_partial_failure" and w.chunk_id is not None for w in warnings)
-            stale = prior - {r.id for r in relations} if replacing and not incomplete else set()
-            if judged and self._llm is not None:
-                marked = await mark_pending(
-                    tx, ns, relations, caps, created_at, source_id=source_id, source_version=source_version, stale=stale
-                )
-                pending.extend(marked)
-                stale -= {rid for item in marked for rid in item.deferred}
+            stale = stale_of(relations) - {rid for item in pending for rid in item.deferred}
             if replacing:
                 produced = {r.id for r in relations}
                 at = aware(default_event_time or created_at)

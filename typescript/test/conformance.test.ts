@@ -403,6 +403,28 @@ describe.skipIf(!PY)("cross-language conformance with the Python SDK", () => {
             },
             rerun_calls: 1,
           });
+          const [initech, globexAt, initechAt] = [
+            ids.relationId("person:ann", "WORKS_AT", "company:initech"),
+            "2022-01-01T00:00:00Z",
+            "2024-01-01T00:00:00Z",
+          ];
+          expect((ops as { judge_order: unknown }).judge_order).toEqual({
+            codes: [
+              ["contradiction_not_judged"],
+              ["contradiction_not_judged", "contradiction_not_judged"],
+              ["relation_superseded", "relation_superseded"],
+            ],
+            asked: [
+              ["New fact: Ann -[WORKS_AT]-> Globex"],
+              ["New fact: Ann -[WORKS_AT]-> Globex"],
+              ["New fact: Ann -[WORKS_AT]-> Globex", "New fact: Ann -[WORKS_AT]-> Initech"],
+            ],
+            state: [
+              [acme, false, globex, globexAt],
+              [globex, false, initech, initechAt],
+              [initech, true, null, null],
+            ],
+          });
         }
         for (const ops of [pyOps, tsOps]) {
           const names = (ops as { unicode_text: { entities: { name: string }[] } }).unicode_text.entities.map(

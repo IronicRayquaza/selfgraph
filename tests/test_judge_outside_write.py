@@ -36,6 +36,19 @@ class WritingLLM:
         return output(**self.answer)
 
 
+class EveryRival:
+    def __init__(self, fails=None):
+        self.fails = fails
+        self.prompts = []
+
+    async def generate(self, *, system, user, output):
+        self.prompts.append(user)
+        if self.fails is not None and f"New fact: Ann -[WORKS_AT]-> {self.fails}" in user:
+            raise RuntimeError("provider down")
+        older = user.split("Older facts:\n", 1)[1].split("\nWhich", 1)[0]
+        return output(retired=list(range(1, older.count("\n") + 2)))
+
+
 class FailingJudge:
     def __init__(self):
         self.prompts = []
@@ -80,14 +93,87 @@ def test_llm_judge_answers_outside_the_write_and_rechecks_what_it_chose():
     assert current(g) == {ACME, GLOBEX} and not marked(g, GLOBEX)
 
 
-def test_llm_judge_drops_a_verdict_when_the_new_relation_changed_while_it_answered():
+def again_graph(g, judge):
+    return SelfGraph(store=g.store, namespace=g.namespace, llm=judge, extraction="regex", contradiction="llm")
+
+
+def test_a_verdict_on_a_new_relation_changed_while_the_judge_answered_stays_pending_on_the_new_revision():
     judge = WritingLLM({"retired": [1]})
     g = ann_graph(judge)
     judge.write = lambda: g.relations.update(GLOBEX, set_properties={"role": "intern"})
     res = run(g.insert.facts({"relations": [works_at("globex", 2022)]}))
-    assert len(judge.prompts) == 1 and res.warnings == []
+    assert len(judge.prompts) == 1 and [w.code for w in res.warnings] == ["contradiction_not_judged"]
     assert current(g) == {ACME, GLOBEX}
-    assert run(g.relations.get(GLOBEX)).revision == 2
+    assert run(g.relations.get(GLOBEX)).revision == 2 and marked(g, GLOBEX)
+    assert not any(
+        v["props"].get(PENDING)
+        for v in run(g.store.list_edge_versions(g.namespace, GLOBEX))
+        if v["props"]["revision"] == 1
+    )
+    later = Judge()
+    lives = {"from_entity": "person:ann", "type": "LIVES_IN", "to_entity": "city:paris"}
+    run(g.entities.create("Paris", "City"))
+    run(again_graph(g, later).insert.facts({"relations": [lives]}))
+    assert [p.split("\n")[0] for p in later.prompts] == ["New fact: Ann -[WORKS_AT]-> Globex {role=intern}"]
+    assert ACME not in current(g) and not marked(g, GLOBEX)
+
+
+def test_a_verdict_whose_rival_changed_while_the_judge_answered_stays_pending_and_is_judged_again():
+    judge = WritingLLM({"retired": [1]})
+    g = ann_graph(judge)
+    judge.write = lambda: g.relations.update(ACME, set_properties={"role": "lead"})
+    res = run(g.insert.facts({"relations": [works_at("globex", 2022)]}))
+    assert [w.code for w in res.warnings] == ["contradiction_not_judged"]
+    assert current(g) == {ACME, GLOBEX} and marked(g, GLOBEX)
+    later = Judge()
+    run(again_graph(g, later).insert.facts({"relations": [works_at("globex", 2022)]}))
+    assert len(later.prompts) == 1 and "1. Ann -[WORKS_AT]-> Acme {role=lead}" in later.prompts[0]
+    assert current(g) == {GLOBEX} and not marked(g, GLOBEX)
+    run(again_graph(g, later).insert.facts({"relations": [works_at("globex", 2022)]}))
+    assert len(later.prompts) == 1
+
+
+@pytest.mark.parametrize("via", ["insert", "create"])
+def test_a_write_cut_off_right_after_its_relation_is_stored_leaves_it_marked_or_unwritten(monkeypatch, via):
+    g = ann_graph(Judge())
+    write_evidence = _ops._write_evidence
+
+    async def killed(runner, ns, *args, **kwargs):
+        if await runner.get_current_edge(ns, GLOBEX) is not None:
+            raise KeyboardInterrupt
+        return await write_evidence(runner, ns, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(_ops, "_write_evidence", killed)
+        with pytest.raises(KeyboardInterrupt):
+            if via == "insert":
+                run(g.insert.facts({"relations": [works_at("globex", 2022)]}))
+            else:
+                run(g.relations.create("person:ann", "WORKS_AT", "company:globex", event_time="2022-01-01"))
+    assert GLOBEX not in current(g) or marked(g, GLOBEX)
+    later = Judge()
+    run(again_graph(g, later).insert.facts({"relations": [works_at("globex", 2022)]}))
+    assert len(later.prompts) == 1 and current(g) == {GLOBEX} and not marked(g, GLOBEX)
+
+
+def test_a_judged_write_marks_its_relation_in_the_statement_that_stores_it(monkeypatch):
+    g = ann_graph(Judge())
+    marks = []
+    update = type(g.store).update_current_edge
+
+    async def recorded(self, ns, rid, changes):
+        if PENDING in changes:
+            marks.append(changes[PENDING])
+        return await update(self, ns, rid, changes)
+
+    monkeypatch.setattr(type(g.store), "update_current_edge", recorded)
+    monkeypatch.setattr(SelfGraph, "_judge", lambda self, *a, **k: asyncio.sleep(0, ([], [])))
+    run(g.entities.create("Initech", "Company"))
+    run(g.insert.facts({"relations": [works_at("globex", 2022)]}))
+    run(g.relations.create("person:ann", "WORKS_AT", "company:initech", event_time="2023-01-01"))
+    assert marks == []
+    initech = ids.relation_id("person:ann", "WORKS_AT", "company:initech")
+    assert marked(g, GLOBEX) and marked(g, initech)
 
 
 @pytest.mark.parametrize("recreated", ["rival", "new"])
@@ -104,9 +190,11 @@ def test_llm_judge_drops_a_verdict_when_a_relation_is_created_again_while_it_ans
 
     judge.write = recreate
     res = run(g.insert.facts({"relations": [works_at("globex", 2022)]}))
-    assert len(judge.prompts) == 1 and res.warnings == []
+    assert len(judge.prompts) == 1
+    assert [w.code for w in res.warnings] == (["contradiction_not_judged"] if recreated == "rival" else [])
     now = {r.id: r for r in run(g.relations.list(from_entity="person:ann")).items}
     assert set(now) == {ACME, GLOBEX} and (now[rid].revision, now[rid].properties) == (1, {"role": "temp"})
+    assert marked(g, GLOBEX) == (recreated == "rival")
 
 
 def test_a_judged_write_is_visible_before_its_verdict_and_known_retired_only_after():
@@ -161,6 +249,55 @@ def test_the_next_judged_write_from_the_entity_judges_a_pending_relation_again(l
     assert not marked(g, GLOBEX)
     run(again.insert.facts({"relations": [works_at("globex", 2022)]}))
     assert len(judge.prompts) == 1
+
+
+def test_a_verdict_naming_no_listed_rival_is_invalid_and_keeps_the_judgment_pending():
+    g = ann_graph(Judge(retire=[2]))
+    res = run(g.insert.facts({"relations": [works_at("globex", 2022)]}))
+    assert [w.code for w in res.warnings] == ["contradiction_not_judged"]
+    assert "outside 1..1: [2]" in res.warnings[0].message
+    assert current(g) == {ACME, GLOBEX} and marked(g, GLOBEX)
+    later = Judge()
+    run(again_graph(g, later).insert.facts({"relations": [works_at("globex", 2022)]}))
+    assert len(later.prompts) == 1 and current(g) == {GLOBEX}
+
+
+def test_a_pending_judgment_moves_to_the_revision_that_replaced_its_relation():
+    g = ann_graph(FailingJudge())
+    run(g.insert.facts({"relations": [works_at("globex", 2022)]}))
+    run(g.relations.update(GLOBEX, set_properties={"role": "intern"}))
+    assert not marked(g, GLOBEX)
+    later = Judge()
+    run(g.entities.create("Paris", "City"))
+    lives = {"from_entity": "person:ann", "type": "LIVES_IN", "to_entity": "city:paris"}
+    res = run(again_graph(g, later).insert.facts({"relations": [lives]}))
+    assert [p.split("\n")[0] for p in later.prompts] == ["New fact: Ann -[WORKS_AT]-> Globex {role=intern}"]
+    assert [w.code for w in res.warnings] == ["relation_superseded"]
+    assert ACME not in current(g)
+    assert not any(v["props"].get(PENDING) for v in run(g.store.list_edge_versions(g.namespace, GLOBEX)))
+    run(again_graph(g, later).insert.facts({"relations": [lives]}))
+    assert len(later.prompts) == 1
+
+
+def test_a_later_judgment_waits_for_an_older_one_so_valid_time_history_stays_in_order():
+    g = ann_graph(FailingJudge())
+    run(g.insert.facts({"relations": [works_at("globex", 2022)]}))
+    run(g.entities.create("Initech", "Company"))
+    initech = ids.relation_id("person:ann", "WORKS_AT", "company:initech")
+    res = run(again_graph(g, EveryRival(fails="Globex")).insert.facts({"relations": [works_at("initech", 2024)]}))
+    assert [w.code for w in res.warnings] == ["contradiction_not_judged", "contradiction_not_judged"]
+    assert f"{initech} stay pending behind it" in res.warnings[1].message
+    assert current(g) == {ACME, GLOBEX, initech} and marked(g, GLOBEX) and marked(g, initech)
+    later = EveryRival()
+    run(again_graph(g, later).insert.facts({"relations": [works_at("initech", 2024)]}))
+    assert [p.split("\n")[0] for p in later.prompts] == [
+        "New fact: Ann -[WORKS_AT]-> Globex",
+        "New fact: Ann -[WORKS_AT]-> Initech",
+    ]
+    assert current(g) == {initech}
+    acme, globex = (run(g.relations.versions(rid))[-1] for rid in (ACME, GLOBEX))
+    assert (acme.invalidated_by, acme.invalidated_at.year) == (GLOBEX, 2022)
+    assert (globex.invalidated_by, globex.invalidated_at.year) == (initech, 2024)
 
 
 @pytest.mark.parametrize("failure", [TransientError("write contention"), StoreError("store gone")])
